@@ -127,80 +127,145 @@ read in population data
 
 
 
-##Step 2. load in filtered data & wrangle it
+
 ```{r}
 
-#if you want to read in individual files
-#files <- list.files("~/Documents/CR meta mobility data", pattern = "_processed\\.csv$", full.names = TRUE)
-#list2env(
-  #setNames(lapply(files, fread), tools::file_path_sans_ext(basename(files))),
-  #envir = .GlobalEnv
-#)
+## --- NEW: read both inputs ---
+setwd("~/Downloads")
+#ca_data <- read.csv("all_processed_combined.csv")
+setwd("~/Costa-Rica-Mobility/Data")
+pop_tiles <- read.csv("tile_activity_with_population.csv")  # expects columns: xtile, ytile, population
+pop_tiles <- geojsonsf::geojson_sf(
+  pop_tiles$geometry  # vector of GeoJSON strings
+) %>%
+  # geojson_sf returns an sf with geometry but drops other columns, so join back:
+  bind_cols(pop_tiles %>% select(-geometry))
 
-setwd("~/Documents/CR meta mobility data")
-ca_data <- read.csv("all_processed_combined.csv") 
+## --- moved up (so we can use it to tile origins) ---
+zoom <- 13  # may fiddle with this (10 is way too coarse for me)
 
+# pop_tiles is sf with columns: activity, sum, geometry
+# 1) rename population col
+pop_tiles <- pop_tiles %>% rename(population = sum)
+
+# 2) get centroids in lon/lat (EPSG:4326) and compute tile indices at your zoom
+cent <- st_centroid(st_transform(pop_tiles, 4326))
+cc <- st_coordinates(cent)
+
+xy <- map2_dfr(cc[,1], cc[,2], ~{
+  t <- lonlat_to_tilenum(.x, .y, zoom)   # your existing helper
+  tibble(xtile = as.integer(t$x), ytile = as.integer(t$y))
+})
+
+# 3) drop geometry for the join and attach the xtile/ytile
+pop_tiles <- bind_cols(st_drop_geometry(pop_tiles), xy)
+
+## --- NEW: compute origin tiles & join origin population ---
+## NOTE: adjust 'home_longitude'/'home_latitude' if your origin cols are named differently
+orig_df <- ca_data %>%
+  rowwise() %>%
+  mutate(o_tile = list(lonlat_to_tilenum(home_longitude, home_latitude, zoom))) %>%  # <-- origin tiles
+  mutate(o_xtile = o_tile$x, o_ytile = o_tile$y) %>%
+  ungroup() %>%
+  left_join(pop_tiles, by = c("o_xtile" = "xtile", "o_ytile" = "ytile")) %>%
+  mutate(origin_pop = ifelse(is.na(population), 0, population))
 
 ## summaries daytime activity
-activity_summary <- ca_data %>% 
+## (unchanged filter line kept commented)
+activity_summary <- orig_df %>% 
   #filter(day_or_night == "daytime") %>% # may switch to night for heat-ag proj
   group_by(visit_latitude, visit_longitude) %>% # only interested in visit location not home
-  summarise(activity = max(visit_fraction, na.rm = TRUE), .groups = "drop") # could use mean
-## compute activity indices for each tile location
-zoom <- 13  # (kept for your context; not used below)
+  ## --- CHANGED: population-weighted sum over origins visiting each destination point ---
+  summarise(activity = sum(visit_fraction * origin_pop, na.rm = TRUE), .groups = "drop")
+
+## compute activity indices for each tile location (destination tiles)
 tile_df <- activity_summary %>% 
   rowwise() %>% # need for lonlat_* since its returned as a list per row
   mutate(tile = list(lonlat_to_tilenum(visit_longitude, visit_latitude, zoom))) %>% 
   mutate(xtile = tile$x, ytile = tile$y) %>% # extract x & y index of tile
   ungroup()
-## aggregate activity by tile 
-# remember i'm using max here but could be mean
+
+## aggregate activity by tile
+## --- CHANGED: sum (since we already computed weighted contributions), not max ---
 tile_activity <- tile_df %>% 
   group_by(xtile, ytile) %>% 
-  summarise(activity = max(activity), .groups = "drop")
+  summarise(activity = sum(activity, na.rm = TRUE), .groups = "drop")
+
 ## compute bounding box for each tile
-# for each tile (xtile, ytile) comput its bbox in lat/lon coords
 bbox_df <- tile_activity %>% 
   rowwise() %>% 
   mutate(bbox = list(tile_bbox(xtile, ytile, zoom))) %>% 
   mutate(lng1 = bbox$xmin, lng2 = bbox$xmax, # left/right longitudes
          lat1 = bbox$ymin, lat2 = bbox$ymax) %>%  # bottom/top latitudes
   ungroup()
+
 ## create tile polygons
-# build each tile polygon using its 4 corners, and close it by repeating the first point
 polygon_list <- purrr::pmap(list(bbox_df$lng1, bbox_df$lng2, bbox_df$lat1, bbox_df$lat2),
                             function(xmin, xmax, ymin, ymax) {
                               st_polygon(list(matrix(c(
                                  xmin, ymin, # bottom left
-                                 xmax, ymin, # bottom eirght
+                                 xmax, ymin, # bottom right
                                  xmax, ymax, # top right
                                  xmin, ymax, # top left
                                  xmin, ymin), # close polygon
                                  ncol = 2, byrow = TRUE)))
                             })
+
 ## create sf object
-# attach activity values & geometry into a spatial object
+## If tile_bbox() returns Web Mercator meters, keep crs = 3857 then transform; 
+## if it returns lon/lat, set crs = 4326 directly.
 tile_activity_sf <- st_sf(activity = bbox_df$activity,
-                          geometry = st_sfc(polygon_list, crs = 3857)) # check, but i thik tile_bbox gives web mercator coords
+                          geometry = st_sfc(polygon_list, crs = 3857)) # keep as in your code
 # convert 3857 to 4326 for leaflet & downstream analysis
 tile_activity_lonlat <- st_transform(tile_activity_sf, crs = 4326) 
-## ^^^ this is the dataset used to summarize later
 
-#save output
+## save output (unchanged file targets; rename if you want to distinguish weighted)
+if (!dir.exists("data")) dir.create("data")
 st_write(tile_activity_lonlat, "data/tile_activity_lonlat.gpkg", delete_dsn = TRUE)
-
+st_write(tile_activity_lonlat, "data/tile_activity_lonlat.shp", delete_layer = TRUE)
+st_write(tile_activity_lonlat, "data/tile_activity_lonlat.geojson", delete_dsn = TRUE)
 ```
+
+
+
+
 ##Step 3. Plot it in Leaflet
 ```{r}
+
+tile_activity_lonlat<-tile_activity_lonlat%>%
+  mutate(activity_log=log(activity+1))
+
 # create color scale
-pal <- colorNumeric("YlOrRd", domain = tile_activity_lonlat$activity, na.color = "transparent")
+pal <- colorNumeric("YlOrRd", domain = tile_activity_lonlat$activity_log, na.color = "transparent")
 ## create leaflet map
 leaflet(tile_activity_lonlat) %>% 
   addTiles() %>% 
-  addPolygons(fillColor = ~pal(activity),
+  addPolygons(fillColor = ~pal(activity_log),
               weight = 1, color = "black", fillOpacity = 0.7,
               popup = ~paste0("Activity", round(activity, 3))) %>% 
   addLegend(pal = pal, values = ~activity, title = "Activity Level", position = "bottomright")
+
+
+library(leaflet)
+
+pop_tiles<-pop_tiles%>%
+  mutate(sum_log=log(sum+1))
+
+pal <- colorNumeric("YlGnBu", domain = pop_tiles$sum_log, na.color = "transparent")
+
+leaflet(pop_tiles) %>% 
+  addTiles() %>% 
+  addPolygons(
+    fillColor = ~pal(sum_log),
+    color = "black", weight = 0.5, fillOpacity = 0.7,
+    popup = ~paste0("Population: ", round(sum_log))
+  ) %>%
+  addLegend(
+    pal = pal, values = ~sum_log,
+    title = "Population",
+    position = "bottomright"
+  )
+
 ```
 ##Step 4. Summarize and merge with polygon boundary
 - your CRS might be different (play around with st_valid() etc)
