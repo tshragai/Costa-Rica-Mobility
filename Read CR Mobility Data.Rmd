@@ -8,22 +8,220 @@ date: "2025-10-17"
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-## R Markdown
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
-
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
 
 ```{r cars}
-summary(cars)
+## upload necessary packages
+library(sf)
+library(terra)
+library(tidyverse)
+library(tigris)
+library(data.table)
+library(leaflet)
+library(RColorBrewer)
+library(slippymath)
+## upload shapefile -- make this whatever polygon you want to extract to could be county or census tract
+# california state parks shp (casp)
+#casp_shp <- st_read("data/raw/parks/casp_individualpark_boundaries/ParkBoundaries.shp")
+
+setwd("~/Downloads")
 ```
 
-## Including Plots
 
-You can also embed plots, for example:
+
+#Meta Activity Maps
+- I only use visit_* tiles (not home_* tiles)
+- I only use daytime observations (not nighttime)
+##Step 1. Reduce memory burden
+- the US csv file was quite large so I had to fiddle around with filtering/making sure my computer didn't explode (play around with this)
+
+
+```{r}
+library(data.table)
+
+## -------- settings you can edit --------
+input_dir   <- "~/Documents/CR meta mobility data"     
+pattern     <- "\\.csv$"                          # only .csv files
+chunk_size  <- 5000
+lat_min <- 7.4; lat_max <- 11.4
+lon_min <- -86.1; lon_max <- -82.8
+country_filter <- "CR"
+zoom <- 13  # (kept for your context; not used below)
+## --------------------------------------
+
+csv_files <- list.files(input_dir, pattern = pattern, full.names = TRUE)
+
+if (length(csv_files) == 0) {
+  stop("No CSV files found in: ", input_dir)
+}
+
+# ----------------------------
+# process a single CSV
+# ----------------------------
+process_one <- function(input_file, output_file) {
+  # fresh output
+  if (file.exists(output_file)) file.remove(output_file)
+  
+  con <- file(input_file, "r")
+  on.exit(close(con), add = TRUE)
+  
+  header <- readLines(con, n = 1)
+  if (length(header) == 0L) return(invisible(NULL))  # empty file
+  
+  repeat {
+    chunk_lines <- readLines(con, n = chunk_size)
+    if (length(chunk_lines) == 0L) break
+    
+    # build a small CSV string with header + this chunk
+    chunk <- fread(paste(c(header, chunk_lines), collapse = "\n"))
+    
+    # filter + append to output
+    chunk[
+      visit_latitude  >= lat_min & visit_latitude  <= lat_max &
+      visit_longitude >= lon_min & visit_longitude <= lon_max &
+      country == country_filter
+    ][
+      , fwrite(.SD, output_file, append = TRUE)
+    ]
+  }
+}
+
+# ===========================================
+##single combined output (optional)
+# ===========================================
+# Uncomment to produce one big file with all filtered rows
+ combined_out <- file.path(input_dir, "all_processed_combined.csv")
+ if (file.exists(combined_out)) file.remove(combined_out)
+ for (infile in csv_files) {
+   message("Appending from: ", basename(infile))
+   # temp file for this input, then append to combined to keep logic clean
+   tmp_out <- tempfile(fileext = ".csv")
+   process_one(infile, tmp_out)
+   if (file.exists(tmp_out) && file.info(tmp_out)$size > 0) {
+     # copy header only once, then append rows
+     if (!file.exists(combined_out)) {
+       file.copy(tmp_out, combined_out)
+     } else {
+       # append without header: read tmp and write append
+       dt <- fread(tmp_out)
+       fwrite(dt, combined_out, append = TRUE)
+     }
+   }
+   unlink(tmp_out)
+ }
+
+# ===========================================
+# MODE A: per-file outputs (recommended)
+# ===========================================
+# Each input 'foo.csv' -> 'foo_processed.csv' in the same folder
+for (infile in csv_files) {
+  outfile <- sub("\\.csv$", "_processed.csv", infile)
+  message("Processing: ", basename(infile), " -> ", basename(outfile))
+  process_one(infile, outfile)
+}
+```
+
+read in population data
+```{r population data}
+
+```
+
+
+
+##Step 2. load in filtered data & wrangle it
+```{r}
+
+#if you want to read in individual files
+#files <- list.files("~/Documents/CR meta mobility data", pattern = "_processed\\.csv$", full.names = TRUE)
+#list2env(
+  #setNames(lapply(files, fread), tools::file_path_sans_ext(basename(files))),
+  #envir = .GlobalEnv
+#)
+
+setwd("~/Documents/CR meta mobility data")
+ca_data <- read.csv("all_processed_combined.csv") 
+
+
+## summaries daytime activity
+activity_summary <- ca_data %>% 
+  filter(day_or_night == "daytime") %>% # may switch to night for heat-ag proj
+  group_by(visit_latitude, visit_longitude) %>% # only interested in visit location not home
+  summarise(activity = max(visit_fraction, na.rm = TRUE), .groups = "drop") # could use mean
+## compute activity indices for each tile location
+tile_df <- activity_summary %>% 
+  rowwise() %>% # need for lonlat_* since its returned as a list per row
+  mutate(tile = list(lonlat_to_tilenum(visit_longitude, visit_latitude, zoom))) %>% 
+  mutate(xtile = tile$x, ytile = tile$y) %>% # extract x & y index of tile
+  ungroup()
+## aggregate activity by tile 
+# remember i'm using max here but could be mean
+tile_activity <- tile_df %>% 
+  group_by(xtile, ytile) %>% 
+  summarise(activity = max(activity), .groups = "drop")
+## compute bounding box for each tile
+# for each tile (xtile, ytile) comput its bbox in lat/lon coords
+bbox_df <- tile_activity %>% 
+  rowwise() %>% 
+  mutate(bbox = list(tile_bbox(xtile, ytile, zoom))) %>% 
+  mutate(lng1 = bbox$xmin, lng2 = bbox$xmax, # left/right longitudes
+         lat1 = bbox$ymin, lat2 = bbox$ymax) %>%  # bottom/top latitudes
+  ungroup()
+## create tile polygons
+# build each tile polygon using its 4 corners, and close it by repeating the first point
+polygon_list <- purrr::pmap(list(bbox_df$lng1, bbox_df$lng2, bbox_df$lat1, bbox_df$lat2),
+                            function(xmin, xmax, ymin, ymax) {
+                              st_polygon(list(matrix(c(
+                                 xmin, ymin, # bottom left
+                                 xmax, ymin, # bottom eirght
+                                 xmax, ymax, # top right
+                                 xmin, ymax, # top left
+                                 xmin, ymin), # close polygon
+                                 ncol = 2, byrow = TRUE)))
+                            })
+## create sf object
+# attach activity values & geometry into a spatial object
+tile_activity_sf <- st_sf(activity = bbox_df$activity,
+                          geometry = st_sfc(polygon_list, crs = 3857)) # check, but i thik tile_bbox gives web mercator coords
+# convert 3857 to 4326 for leaflet & downstream analysis
+tile_activity_lonlat <- st_transform(tile_activity_sf, crs = 4326) 
+## ^^^ this is the dataset used to summarize later
+```
+##Step 3. Plot it in Leaflet
+```{r}
+# create color scale
+pal <- colorNumeric("YlOrRd", domain = tile_activity_lonlat$activity, na.color = "transparent")
+## create leaflet map
+leaflet(tile_activity_lonlat) %>% 
+  addTiles() %>% 
+  addPolygons(fillColor = ~pal(activity),
+              weight = 1, color = "black", fillOpacity = 0.7,
+              popup = ~paste0("Activity", round(activity, 3))) %>% 
+  addLegend(pal = pal, values = ~activity, title = "Activity Level", position = "bottomright")
+```
+##Step 4. Summarize and merge with polygon boundary
+- your CRS might be different (play around with st_valid() etc)
+```{r}
+# fix my polygons
+casp_shp_clean_meta1 <- casp_shp_clean %>% st_make_valid()
+casp_shp_clean_meta <- st_transform(casp_shp_clean_meta1, crs = st_crs(tile_activity_lonlat))
+# find intersection bwn meta data & park polygons
+activity_casp <- st_intersection(activitymap_us1, casp_shp_clean_meta)
+# summarise activity data
+activity_casp_summary <- activity_casp %>% 
+  group_by(UNITNAME) %>% 
+  summarise(mean_activity = mean(activity, na.rm = TRUE),
+            max_activity = max(activity, na.rm = TRUE), 
+            sd_activity = sd(activity, na.rm = TRUE), .groups = "drop") %>% 
+  st_drop_geometry()
+# merge data with park data
+casp_meta_activity <- casp_shp_clean  %>% 
+  left_join(activity_casp_summary, by = "UNITNAME")
+## ^^ this is my final dataset that I'm building with other covariates
+
+```
+
 
 ```{r pressure, echo=FALSE}
-plot(pressure)
+
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
