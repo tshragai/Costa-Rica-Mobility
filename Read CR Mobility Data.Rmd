@@ -46,7 +46,6 @@ chunk_size  <- 5000
 lat_min <- 7.4; lat_max <- 11.4
 lon_min <- -86.1; lon_max <- -82.8
 country_filter <- "CR"
-zoom <- 13  # (kept for your context; not used below)
 ## --------------------------------------
 
 csv_files <- list.files(input_dir, pattern = pattern, full.names = TRUE)
@@ -144,10 +143,11 @@ ca_data <- read.csv("all_processed_combined.csv")
 
 ## summaries daytime activity
 activity_summary <- ca_data %>% 
-  filter(day_or_night == "daytime") %>% # may switch to night for heat-ag proj
+  #filter(day_or_night == "daytime") %>% # may switch to night for heat-ag proj
   group_by(visit_latitude, visit_longitude) %>% # only interested in visit location not home
   summarise(activity = max(visit_fraction, na.rm = TRUE), .groups = "drop") # could use mean
 ## compute activity indices for each tile location
+zoom <- 13  # (kept for your context; not used below)
 tile_df <- activity_summary %>% 
   rowwise() %>% # need for lonlat_* since its returned as a list per row
   mutate(tile = list(lonlat_to_tilenum(visit_longitude, visit_latitude, zoom))) %>% 
@@ -185,6 +185,10 @@ tile_activity_sf <- st_sf(activity = bbox_df$activity,
 # convert 3857 to 4326 for leaflet & downstream analysis
 tile_activity_lonlat <- st_transform(tile_activity_sf, crs = 4326) 
 ## ^^^ this is the dataset used to summarize later
+
+#save output
+st_write(tile_activity_lonlat, "data/tile_activity_lonlat.gpkg", delete_dsn = TRUE)
+
 ```
 ##Step 3. Plot it in Leaflet
 ```{r}
