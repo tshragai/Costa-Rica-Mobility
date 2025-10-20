@@ -110,7 +110,7 @@ process_one <- function(input_file, output_file) {
  }
 
 # ===========================================
-# MODE A: per-file outputs (recommended)
+# per-file outputs
 # ===========================================
 # Each input 'foo.csv' -> 'foo_processed.csv' in the same folder
 for (infile in csv_files) {
@@ -131,10 +131,8 @@ read in population data
 ```{r}
 
 ## --- NEW: read both inputs ---
-setwd("~/Downloads")
-#ca_data <- read.csv("all_processed_combined.csv")
 setwd("~/Costa-Rica-Mobility/Data")
-pop_tiles <- read.csv("tile_activity_with_population.csv")  # expects columns: xtile, ytile, population
+pop_tiles <- read.csv("tile_activity_dual_population_fixed.csv")  # expects columns: xtile, ytile, population
 pop_tiles <- geojsonsf::geojson_sf(
   pop_tiles$geometry  # vector of GeoJSON strings
 ) %>%
