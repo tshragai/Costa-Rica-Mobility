@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Calculate both WorldPop and GHSL population for predefined tiles with proper handling of negative values.
+Calculate both WorldPop and GHSL population for predefined tiles and combine into one file.
 """
 
 import ee
@@ -10,7 +10,7 @@ import os
 
 def main():
     """Calculate both WorldPop and GHSL population for predefined tiles."""
-    print("=== Dual Population Calculation (Fixed Negative Values) ===")
+    print("=== Dual Population Calculation (WorldPop + GHSL) for Predefined Tiles ===")
     
     # Initialize GEE
     ee.Initialize()
@@ -39,16 +39,15 @@ def main():
     
     print("✓ WorldPop data loaded successfully")
     
-    # Load GHSL population image (2025) with proper handling
+    # Load GHSL population image (2025)
     print("Loading GHSL population image (2025)...")
     ghsl_population = (
         ee.Image("JRC/GHSL/P2023A/GHS_POP/2025")
         .select("population_count")
         .clip(tiles)
-        .max(0)  # Ensure no negative values
     )
     
-    print("✓ GHSL population data loaded and negative values filtered")
+    print("✓ GHSL population data loaded successfully")
     
     # Calculate WorldPop population per tile
     print("Calculating WorldPop population per tile...")
@@ -104,9 +103,6 @@ def main():
     df_ghsl = pd.DataFrame(ghsl_data)
     df_ghsl = df_ghsl.rename(columns={'sum': 'ghsl_population_2025'})
     
-    # Ensure no negative values in the final data
-    df_ghsl['ghsl_population_2025'] = df_ghsl['ghsl_population_2025'].clip(lower=0)
-    
     # Merge the datasets
     print("Merging datasets...")
     df_combined = df_worldpop.merge(
@@ -119,7 +115,7 @@ def main():
     df_combined = df_combined[['activity', 'worldpop_population', 'ghsl_population_2025', 'geometry']]
     
     # Save to local Data folder
-    output_file = "Data/tile_activity_dual_population_fixed.csv"
+    output_file = "Data/tile_activity_dual_population_worldpop_ghsl.csv"
     df_combined.to_csv(output_file, index=False)
     
     print(f"✓ Results saved to: {output_file}")
@@ -132,16 +128,12 @@ def main():
     print(f"   GHSL 2025 - Total: {df_combined['ghsl_population_2025'].sum():,.0f}")
     print(f"   Difference: {df_combined['worldpop_population'].sum() - df_combined['ghsl_population_2025'].sum():,.0f}")
     
-    # Check for any remaining negative values
-    negative_count = (df_combined['ghsl_population_2025'] < 0).sum()
-    print(f"   Negative values in GHSL: {negative_count}")
-    
     # Also save as JSON for backup
-    output_json = "Data/tile_activity_dual_population_fixed.json"
+    output_json = "Data/tile_activity_dual_population_worldpop_ghsl.json"
     df_combined.to_json(output_json, orient='records', indent=2)
     print(f"✓ Backup saved as JSON: {output_json}")
     
-    print(f"\n🎉 Success! Your Costa Rica mobility analysis with corrected population data is ready!")
+    print(f"\n🎉 Success! Your Costa Rica mobility analysis with dual population data is ready!")
     print(f"📁 Files saved in your local Data folder:")
     print(f"   - {output_file}")
     print(f"   - {output_json}")
