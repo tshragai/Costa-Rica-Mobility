@@ -20,6 +20,7 @@ library(data.table)
 library(leaflet)
 library(RColorBrewer)
 library(slippymath)
+library(scales)
 ## upload shapefile -- make this whatever polygon you want to extract to could be county or census tract
 # california state parks shp (casp)
 #casp_shp <- st_read("data/raw/parks/casp_individualpark_boundaries/ParkBoundaries.shp")
@@ -110,7 +111,7 @@ process_one <- function(input_file, output_file) {
  }
 
 # ===========================================
-# per-file outputs
+# MODE A: per-file outputs (recommended)
 # ===========================================
 # Each input 'foo.csv' -> 'foo_processed.csv' in the same folder
 for (infile in csv_files) {
@@ -122,6 +123,26 @@ for (infile in csv_files) {
 
 read in population data
 ```{r population data}
+setwd("~/Costa-Rica-Mobility/Data")
+pop_tiles <- st_read("tile_activity_dual_population.geojson")  
+
+#worldpop or GHSL
+pop_tiles <- pop_tiles %>%
+  mutate(population_dif = worldpop_population - ghsl_population_2025) 
+
+# Map difference in values
+ggplot(pop_tiles) +
+  geom_sf(aes(fill = population_dif), color = NA) +
+  scale_fill_gradient2(
+    name = "difference in population",
+    midpoint = 0,
+    low = "#2c7bb6", mid = "white", high = "#d7191c",
+    oob = squish, limits = c(-1000, 1000)   # adjust limits as you like
+  ) +
+  labs(x = NULL, y = NULL) +
+  theme_minimal()
+
+#mmmmm they're pretty different
 
 ```
 
@@ -131,8 +152,9 @@ read in population data
 ```{r}
 
 ## --- NEW: read both inputs ---
-setwd("~/Costa-Rica-Mobility/Data")
-pop_tiles <- read.csv("tile_activity_dual_population_fixed.csv")  # expects columns: xtile, ytile, population
+setwd("~/Downloads")
+ca_data <- read.csv("all_processed_combined.csv")
+
 pop_tiles <- geojsonsf::geojson_sf(
   pop_tiles$geometry  # vector of GeoJSON strings
 ) %>%
