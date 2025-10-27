@@ -124,7 +124,7 @@ for (infile in csv_files) {
 read in population data
 ```{r population data}
 setwd("~/Costa-Rica-Mobility/Data")
-pop_tiles <- st_read("tile_activity_zoom12_dual_population.geojson")  
+pop_tiles <- st_read("costa_rica_activity_tiles_population.geojson")  
 
 #worldpop or GHSL
 pop_tiles <- pop_tiles %>%
@@ -152,11 +152,6 @@ Trying to fix shit
 ## --- Read in activity data ---
 setwd("~/Downloads")
 ca_data <- read.csv("all_processed_combined.csv")
-
-library(dplyr)
-library(sf)
-library(geosphere)
-library(leaflet)
 
 # 1) Unique visit centroids in WGS84
 pts_ll <- st_as_sf(
@@ -217,120 +212,117 @@ leaflet() %>%
                    fillOpacity = 1, stroke = FALSE) 
 
 
+## save output (unchanged file targets; rename if you want to distinguish weighted)
+if (!dir.exists("data")) dir.create("data")
+st_write(squares_ll, "data/costa_rica_activity_tiles.gpkg", delete_dsn = TRUE)
+
 ######################
 
-library(dplyr)
-library(purrr)
-library(sf)
-library(leaflet)
-
-# ---------------------------
-# Bing / XYZ tile utilities
-# ---------------------------
-lonlat_to_tile_xyz <- function(lon, lat, z) {
-  n <- 2^z
-  x <- floor((lon + 180) / 360 * n)
-  lat_rad <- lat * pi/180
-  y <- floor((1 - log(tan(lat_rad) + 1/cos(lat_rad)) / pi) / 2 * n)
-  list(x = as.integer(x), y = as.integer(y))
-}
-
-tile_bbox_xyz <- function(x, y, z) {
-  n <- 2^z
-  lon_min <- 360 * (x / n) - 180
-  lon_max <- 360 * ((x + 1) / n) - 180
-  tile2lat <- function(ty) 180/pi * atan(sinh(pi * (1 - 2 * ty / n)))
-  lat_max <- tile2lat(y)
-  lat_min <- tile2lat(y + 1)
-  list(xmin = lon_min, ymin = lat_min, xmax = lon_max, ymax = lat_max)
-}
-
-tile_center_xyz <- function(x, y, z) {
-  b <- tile_bbox_xyz(x, y, z)
-  c(lon = (b$xmin + b$xmax)/2, lat = (b$ymin + b$ymax)/2)
-}
-
-poly_from_bbox <- function(xmin, ymin, xmax, ymax) {
-  st_polygon(list(matrix(
-    c(xmin,ymin,  xmax,ymin,  xmax,ymax,  xmin,ymax,  xmin,ymin),
-    ncol = 2, byrow = TRUE
-  )))
-}
-
-# ---------------------------
-# 1) Unique points (WGS84)
-# ---------------------------
-pts_ll <- st_as_sf(
-  ca_data %>% distinct(visit_longitude, visit_latitude),
-  coords = c("visit_longitude","visit_latitude"),
-  crs = 4326
-)
-
-# ---------------------------
-# 2) Compute Bing z=13 tiles
-# ---------------------------
-z <- 13L
-
-tiles_idx <- pts_ll %>%
-  st_coordinates() %>%
-  as.data.frame() %>%
-  rename(lon = X, lat = Y) %>%
-  rowwise() %>%
-  mutate(t = list(lonlat_to_tile_xyz(lon, lat, z)),
-         xtile = t$x, ytile = t$y) %>%
-  ungroup() %>%
-  distinct(xtile, ytile)
-
-# Polygons for those tiles (WGS84)
-bb <- pmap(tiles_idx, ~ tile_bbox_xyz(..1, ..2, z))
-bb_df <- tibble::tibble(
-  xtile = tiles_idx$xtile,
-  ytile = tiles_idx$ytile,
-  xmin  = vapply(bb, `[[`, numeric(1), "xmin"),
-  ymin  = vapply(bb, `[[`, numeric(1), "ymin"),
-  xmax  = vapply(bb, `[[`, numeric(1), "xmax"),
-  ymax  = vapply(bb, `[[`, numeric(1), "ymax")
-)
-
-tiles13_ll <- st_sf(
-  xtile = bb_df$xtile,
-  ytile = bb_df$ytile,
-  geometry = st_sfc(pmap(bb_df[,c("xmin","ymin","xmax","ymax")],
-                         ~ poly_from_bbox(..1, ..2, ..3, ..4)),
-                    crs = 4326)
-)
-
-# True centers of those tiles (WGS84)
-centers_df <- tiles_idx %>%
-  rowwise() %>%
-  mutate(c = list(tile_center_xyz(xtile, ytile, z)),
-         lon = c["lon"], lat = c["lat"]) %>%
-  ungroup()
-
-centers13_ll <- st_as_sf(centers_df, coords = c("lon","lat"), crs = 4326)
-
-# ---------------------------
-# 3) Leaflet comparison map
-# ---------------------------
-leaflet() %>%
-  addTiles() %>%
-  addPolygons(data = tiles13_ll, group = "Bing tiles z=13",
-              color = "#2c7fb8", weight = 1.5, fill = FALSE, opacity = 0.9) %>%
-  #addCircleMarkers(data = centers13_ll, group = "z=13 tile centers",
-   #                radius = 2.5, color = "#2c7fb8",
-    #               fillColor = "#2c7fb8", fillOpacity = 1, stroke = FALSE) %>%
-  addCircleMarkers(data = pts_ll, group = "ca_data centroids",
-                   radius = 2.5, color = "#111111",
-                   fillColor = "#000000", fillOpacity = 1, stroke = FALSE) #%>%
-  #addPolygons(data = squares_ll, group = "Squares",
-   #           color = "#e34a33", weight = 2, opacity = 1,
-    #          fillColor = "#e34a33", fillOpacity = 0.35) 
-  
+# # ---------------------------
+# # Bing / XYZ tile utilities
+# # ---------------------------
+# lonlat_to_tile_xyz <- function(lon, lat, z) {
+#   n <- 2^z
+#   x <- floor((lon + 180) / 360 * n)
+#   lat_rad <- lat * pi/180
+#   y <- floor((1 - log(tan(lat_rad) + 1/cos(lat_rad)) / pi) / 2 * n)
+#   list(x = as.integer(x), y = as.integer(y))
+# }
+# 
+# tile_bbox_xyz <- function(x, y, z) {
+#   n <- 2^z
+#   lon_min <- 360 * (x / n) - 180
+#   lon_max <- 360 * ((x + 1) / n) - 180
+#   tile2lat <- function(ty) 180/pi * atan(sinh(pi * (1 - 2 * ty / n)))
+#   lat_max <- tile2lat(y)
+#   lat_min <- tile2lat(y + 1)
+#   list(xmin = lon_min, ymin = lat_min, xmax = lon_max, ymax = lat_max)
+# }
+# 
+# tile_center_xyz <- function(x, y, z) {
+#   b <- tile_bbox_xyz(x, y, z)
+#   c(lon = (b$xmin + b$xmax)/2, lat = (b$ymin + b$ymax)/2)
+# }
+# 
+# poly_from_bbox <- function(xmin, ymin, xmax, ymax) {
+#   st_polygon(list(matrix(
+#     c(xmin,ymin,  xmax,ymin,  xmax,ymax,  xmin,ymax,  xmin,ymin),
+#     ncol = 2, byrow = TRUE
+#   )))
+# }
+# 
+# # ---------------------------
+# # 1) Unique points (WGS84)
+# # ---------------------------
+# pts_ll <- st_as_sf(
+#   ca_data %>% distinct(visit_longitude, visit_latitude),
+#   coords = c("visit_longitude","visit_latitude"),
+#   crs = 4326
+# )
+# 
+# # ---------------------------
+# # 2) Compute Bing z=13 tiles
+# # ---------------------------
+# z <- 13L
+# 
+# tiles_idx <- pts_ll %>%
+#   st_coordinates() %>%
+#   as.data.frame() %>%
+#   rename(lon = X, lat = Y) %>%
+#   rowwise() %>%
+#   mutate(t = list(lonlat_to_tile_xyz(lon, lat, z)),
+#          xtile = t$x, ytile = t$y) %>%
+#   ungroup() %>%
+#   distinct(xtile, ytile)
+# 
+# # Polygons for those tiles (WGS84)
+# bb <- pmap(tiles_idx, ~ tile_bbox_xyz(..1, ..2, z))
+# bb_df <- tibble::tibble(
+#   xtile = tiles_idx$xtile,
+#   ytile = tiles_idx$ytile,
+#   xmin  = vapply(bb, `[[`, numeric(1), "xmin"),
+#   ymin  = vapply(bb, `[[`, numeric(1), "ymin"),
+#   xmax  = vapply(bb, `[[`, numeric(1), "xmax"),
+#   ymax  = vapply(bb, `[[`, numeric(1), "ymax")
+# )
+# 
+# tiles13_ll <- st_sf(
+#   xtile = bb_df$xtile,
+#   ytile = bb_df$ytile,
+#   geometry = st_sfc(pmap(bb_df[,c("xmin","ymin","xmax","ymax")],
+#                          ~ poly_from_bbox(..1, ..2, ..3, ..4)),
+#                     crs = 4326)
+# )
+# 
+# # True centers of those tiles (WGS84)
+# centers_df <- tiles_idx %>%
+#   rowwise() %>%
+#   mutate(c = list(tile_center_xyz(xtile, ytile, z)),
+#          lon = c["lon"], lat = c["lat"]) %>%
+#   ungroup()
+# 
+# centers13_ll <- st_as_sf(centers_df, coords = c("lon","lat"), crs = 4326)
+# 
+# # ---------------------------
+# # 3) Leaflet comparison map
+# # ---------------------------
+# leaflet() %>%
+#   addTiles() %>%
+#   addPolygons(data = tiles13_ll, group = "Bing tiles z=13",
+#               color = "#2c7fb8", weight = 1.5, fill = FALSE, opacity = 0.9) %>%
+#   #addCircleMarkers(data = centers13_ll, group = "z=13 tile centers",
+#    #                radius = 2.5, color = "#2c7fb8",
+#     #               fillColor = "#2c7fb8", fillOpacity = 1, stroke = FALSE) %>%
+#   addCircleMarkers(data = pts_ll, group = "ca_data centroids",
+#                    radius = 2.5, color = "#111111",
+#                    fillColor = "#000000", fillOpacity = 1, stroke = FALSE) #%>%
+#   #addPolygons(data = squares_ll, group = "Squares",
+#    #           color = "#e34a33", weight = 2, opacity = 1,
+#     #          fillColor = "#e34a33", fillOpacity = 0.35) 
+#   
 
 
 ```
-
-
 
 ```{r}
 
@@ -338,98 +330,111 @@ leaflet() %>%
 setwd("~/Downloads")
 ca_data <- read.csv("all_processed_combined.csv")
 
-## set zoom levels, size of tiles around the points. 
-zoom <- 13  # it looks like it has to be 13... but points are off center
+library(sf)
+library(dplyr)
 
-# pop_tiles is sf with columns: activity, sum, geometry
-# 1) rename population col to the population data we'll use
-pop_tiles <- pop_tiles %>% rename(population = ghsl_population_2025)
+## --- Use your calculated tiles in pop_tiles ---
+# pop_tiles must be sf with a polygon geometry
+# and a population column we'll use for weighting.
+pop_tiles <- pop_tiles %>%
+  dplyr::rename(population = ghsl_population_2025)
 
-# 2) get centroids in lon/lat (EPSG:4326) and compute tile indices at your zoom
-cent <- st_centroid(st_transform(pop_tiles, 4326))
-cc <- st_coordinates(cent)
+# Ensure pop_tiles has a unique tile id
+if (!("tile_id" %in% names(pop_tiles))) {
+  pop_tiles <- pop_tiles %>% dplyr::mutate(tile_id = dplyr::row_number())
+}
 
-xy <- map2_dfr(cc[,1], cc[,2], ~{
-  t <- lonlat_to_tilenum(.x, .y, zoom)   # your existing helper
-  tibble(xtile = as.integer(t$x), ytile = as.integer(t$y))
-})
+tiles_crs <- st_crs(pop_tiles)
 
-# 3) drop geometry for the join and attach the xtile/ytile
-pop_tiles <- bind_cols(st_drop_geometry(pop_tiles), xy)
+## --- 1) Attach ORIGIN population by spatial join ---
+home_sf <- st_as_sf(
+  ca_data,
+  coords = c("home_longitude", "home_latitude"),
+  crs = 4326, remove = FALSE
+) %>% st_transform(tiles_crs)
 
-## compute origin tiles & join origin population 
-## NOTE: adjust 'home_longitude'/'home_latitude' if your origin cols are named differently
-orig_df <- ca_data %>%
-  rowwise() %>%
-  mutate(o_tile = list(lonlat_to_tilenum(home_longitude, home_latitude, zoom))) %>%  # <-- origin tiles
-  mutate(o_xtile = o_tile$x, o_ytile = o_tile$y) %>%
-  ungroup() %>%
-  left_join(pop_tiles, by = c("o_xtile" = "xtile", "o_ytile" = "ytile")) %>%
-  mutate(origin_pop = ifelse(is.na(population), 0, population))
+home_with_pop <- st_join(
+  home_sf, pop_tiles[, c("tile_id","population")],
+  join = st_within, left = TRUE
+)
 
-## summaries activity
-## (unchanged filter line kept commented)
-activity_summary <- orig_df %>% 
-  #filter(day_or_night == "daytime") %>% # keep day and night
-  group_by(visit_latitude, visit_longitude) %>% # only interested in visit location not home
-  ## population-weighted sum over origins visiting each destination point ---
-  summarise(activity = sum(visit_fraction * origin_pop, na.rm = TRUE), .groups = "drop")
+home_with_pop$origin_pop <- ifelse(is.na(home_with_pop$population), 0, home_with_pop$population)
+home_with_pop$o_tile_id  <- home_with_pop$tile_id
 
-## compute activity indices for each tile location (destination tiles)
-tile_df <- activity_summary %>% 
-  rowwise() %>% # need for lonlat_* since its returned as a list per row
-  mutate(tile = list(lonlat_to_tilenum(visit_longitude, visit_latitude, zoom))) %>% 
-  mutate(xtile = tile$x, ytile = tile$y) %>% # extract x & y index of tile
-  ungroup()
+home_info <- home_with_pop %>%
+  st_drop_geometry() %>%
+  dplyr::select(o_tile_id, origin_pop)
 
-## aggregate activity by tile
-##  sum (since we already computed weighted contributions), not max ---
-tile_activity <- tile_df %>% 
-  group_by(xtile, ytile) %>% 
-  summarise(activity = sum(activity, na.rm = TRUE), .groups = "drop")
+stopifnot(nrow(home_info) == nrow(ca_data))
+ca_aug <- bind_cols(ca_data, home_info)
 
-## compute bounding box for each tile
-bbox_df <- tile_activity %>% 
-  rowwise() %>% 
-  mutate(bbox = list(tile_bbox(xtile, ytile, zoom))) %>% 
-  mutate(lng1 = bbox$xmin, lng2 = bbox$xmax, # left/right longitudes
-         lat1 = bbox$ymin, lat2 = bbox$ymax) %>%  # bottom/top latitudes
-  ungroup()
+## --- 2) Assign DESTINATION tile (visit point -> destination tile) ---
+visit_sf <- st_as_sf(
+  ca_aug,
+  coords = c("visit_longitude", "visit_latitude"),
+  crs = 4326, remove = FALSE
+) %>% st_transform(tiles_crs)
 
-## create tile polygons
-polygon_list <- purrr::pmap(list(bbox_df$lng1, bbox_df$lng2, bbox_df$lat1, bbox_df$lat2),
-                            function(xmin, xmax, ymin, ymax) {
-                              st_polygon(list(matrix(c(
-                                 xmin, ymin, # bottom left
-                                 xmax, ymin, # bottom right
-                                 xmax, ymax, # top right
-                                 xmin, ymax, # top left
-                                 xmin, ymin), # close polygon
-                                 ncol = 2, byrow = TRUE)))
-                            })
+visit_with_tile <- st_join(
+  visit_sf, pop_tiles[, c("tile_id")],
+  join = st_within, left = TRUE
+)
 
-## create sf object
-## If tile_bbox() returns Web Mercator meters, keep crs = 3857 then transform; 
-## if it returns lon/lat, set crs = 4326 directly.
-tile_activity_sf <- st_sf(activity = bbox_df$activity,
-                          geometry = st_sfc(polygon_list, crs = 3857)) # keep as in your code
-# convert 3857 to 4326 for leaflet & downstream analysis
-tile_activity_lonlat <- st_transform(tile_activity_sf, crs = 4326) 
+visit_info <- visit_with_tile %>%
+  st_drop_geometry() %>%
+  dplyr::mutate(d_tile_id = tile_id) %>%
+  dplyr::select(d_tile_id)
 
-## save output (unchanged file targets; rename if you want to distinguish weighted)
+stopifnot(nrow(visit_info) == nrow(ca_aug))
+ca_aug <- bind_cols(ca_aug, visit_info)
+
+## --- 3) Summarize population-weighted activity per destination tile ---
+# Optional filter if you want only daytime:
+# ca_aug <- dplyr::filter(ca_aug, day_or_night == "daytime")
+
+### (A) Overall activity
+tile_activity_overall <- ca_aug %>%
+  dplyr::filter(!is.na(d_tile_id)) %>%
+  dplyr::mutate(weighted_activity = visit_fraction * origin_pop) %>%
+  dplyr::group_by(d_tile_id) %>%
+  dplyr::summarise(activity = sum(weighted_activity, na.rm = TRUE), .groups = "drop")
+
+### (B) Activity by ds
+tile_activity_by_ds <- ca_aug %>%
+  dplyr::filter(!is.na(d_tile_id)) %>%
+  dplyr::mutate(weighted_activity = visit_fraction * origin_pop) %>%
+  dplyr::group_by(d_tile_id, ds) %>%
+  dplyr::summarise(activity = sum(weighted_activity, na.rm = TRUE), .groups = "drop")
+
+## --- 4) Attach geometry (destination tiles) ---
+tile_activity_overall_sf <- pop_tiles %>%
+  dplyr::select(tile_id, geometry) %>%
+  dplyr::right_join(tile_activity_overall, by = c("tile_id" = "d_tile_id"))
+
+tile_activity_by_ds_sf <- pop_tiles %>%
+  dplyr::select(tile_id, geometry) %>%
+  dplyr::right_join(tile_activity_by_ds, by = c("tile_id" = "d_tile_id"))
+
+## --- 5) Save outputs ---
 if (!dir.exists("data")) dir.create("data")
-st_write(tile_activity_lonlat, "data/tile_activity_lonlat_zoom12.gpkg", delete_dsn = TRUE)
-st_write(tile_activity_lonlat, "data/tile_activity_lonlat_zoom12.shp", delete_layer = TRUE)
-st_write(tile_activity_lonlat, "data/tile_activity_lonlat_zoom12.geojson", delete_dsn = TRUE)
+
+st_write(tile_activity_overall_sf, "data/activity_by_pop_tiles_overall.gpkg", delete_dsn = TRUE)
+st_write(tile_activity_by_ds_sf, "data/activity_by_pop_tiles_by_ds.gpkg", delete_dsn = TRUE)
+
+# Optionally, also WGS84 for leaflet
+tile_activity_overall_ll <- st_transform(tile_activity_overall_sf, 4326)
+tile_activity_by_ds_ll <- st_transform(tile_activity_by_ds_sf, 4326)
+
+st_write(tile_activity_overall_ll, "data/activity_by_pop_tiles_overall_wgs84.geojson", delete_dsn = TRUE)
+st_write(tile_activity_by_ds_ll, "data/activity_by_pop_tiles_by_ds_wgs84.geojson", delete_dsn = TRUE)
+
 ```
-
-
 
 
 ##Step 3. Plot it in Leaflet
 ```{r}
 
-tile_activity_lonlat<-tile_activity_lonlat%>%
+tile_activity_lonlat<-tile_activity_ll%>%
   mutate(activity_log=log(activity+1))
 
 # create color scale
@@ -452,32 +457,6 @@ leaflet(tile_activity_lonlat) %>%
               popup = ~paste0("Activity", round(activity, 3))) %>% 
   addLegend(pal = pal, values = ~activity, title = "Activity Level", position = "bottomright")
 
-
-#view the underlying movement data
-visit_counts <- ca_data %>%
-  count(visit_latitude, visit_longitude, name = "n_visits")
- visit_points <- st_as_sf(
-     visit_counts,
-     coords = c("visit_longitude", "visit_latitude"),
-     crs = 4326  # WGS84 lat/lon
- )
-pal <- colorNumeric("YlOrRd", domain = log(visit_points$n_visits+1))
-
-leaflet(visit_points) %>%
-  addTiles() %>%
-  addCircleMarkers(
-    radius = 4,
-    stroke = FALSE,
-    fillOpacity = 0.7,
-    color = ~pal(log(n_visits+1)),
-    popup = ~paste0("Visits: ", log(n_visits+1))
-  ) %>%
-  addLegend(
-    pal = pal,
-    values = ~n_visits,
-    title = "Number of visits",
-    position = "bottomright"
-  )
  
 
 ```
@@ -506,7 +485,7 @@ districts <- st_transform(districts, st_crs(tile_activity_lonlat))
 
 # --- 2) Compute totals per district using area-aware overlay ---
 # Work in a projected CRS for correct area math
-tiles_m   <- st_transform(tile_activity_lonlat, 3857) %>%
+tiles_m   <- st_transform(tile_activity_ll, 3857) %>%
   mutate(
     tile_area_m2     = as.numeric(st_area(geometry)),
     activity_density = activity / tile_area_m2   # activity per m^2
@@ -585,119 +564,9 @@ pal <- colorNumeric(
   domain  = log1p(districts_with_activity$total_activity),
   na.color = "transparent"
 )
-```
 
-
-```{r pressure, echo=FALSE}
-# ===========================================================
-# District-to-District Activity Data 
-# ===========================================================
-
-# ---- 3) Compute origin tile & origin_pop on same grid ----
-orig_df <- ca_data %>%
-  rowwise() %>%
-  mutate(o_tile = list(slippymath::lonlat_to_tilenum(home_longitude, home_latitude, zoom))) %>%
-  mutate(o_xtile = o_tile$x, o_ytile = o_tile$y) %>%
-  ungroup() %>%
-  left_join(pop_tiles, by = c("o_xtile" = "xtile", "o_ytile" = "ytile")) %>%
-  mutate(origin_pop = ifelse(is.na(population), 0, population))
-
-# ---- 4) Destination tile indices & tile->tile weighted flows ----
-od_tiles <- orig_df %>%
-  rowwise() %>%
-  mutate(d_tile = list(slippymath::lonlat_to_tilenum(visit_longitude, visit_latitude, zoom))) %>%
-  mutate(d_xtile = d_tile$x, d_ytile = d_tile$y) %>%
-  ungroup() %>%
-  select(o_xtile, o_ytile, d_xtile, d_ytile, visit_fraction, origin_pop)
-
-tile_flows <- od_tiles %>%
-  group_by(o_xtile, o_ytile, d_xtile, d_ytile) %>%
-  summarise(weight = sum(visit_fraction * origin_pop, na.rm = TRUE), .groups = "drop") %>%
-  filter(weight > 0)
-
-# ---- 5) Build tile polygons correctly (CRS fix) ----
-
-# tiles we need (both ends)
-tiles_needed <- bind_rows(
-  tile_flows %>% transmute(xtile = o_xtile, ytile = o_ytile),
-  tile_flows %>% transmute(xtile = d_xtile, ytile = d_ytile)
-) %>% distinct()
-
-# helper: polygon from bbox
-poly_from_bbox <- function(xmin, ymin, xmax, ymax) {
-  st_polygon(list(matrix(
-    c(xmin,ymin,  xmax,ymin,  xmax,ymax,  xmin,ymax,  xmin,ymin),
-    ncol = 2, byrow = TRUE
-  )))
-}
-
-# collect bboxes
-bboxes <- pmap(tiles_needed, function(xtile, ytile) {
-  b <- tile_bbox(xtile, ytile, zoom)  # your helper; must return xmin/xmax (lon or meters), ymin/ymax (lat or meters)
-  list(xtile = xtile, ytile = ytile, xmin = b$xmin, ymin = b$ymin, xmax = b$xmax, ymax = b$ymax)
-})
-
-bbox_df <- as_tibble(do.call(rbind, lapply(bboxes, as.data.frame)))
-
-# detect bbox units -> set creation CRS
-is_lonlat <- with(bbox_df, max(abs(c(xmin, xmax))) <= 180 && max(abs(c(ymin, ymax))) <= 90)
-crs_bbox  <- if (is_lonlat) 4326 else 3857
-
-# build sfc once
-poly_list <- pmap(bbox_df[, c("xmin","ymin","xmax","ymax")], poly_from_bbox)
-tiles_raw <- st_sf(
-  xtile = bbox_df$xtile,
-  ytile = bbox_df$ytile,
-  geometry = st_sfc(poly_list, crs = crs_bbox)
-)
-stopifnot(!any(st_is_empty(tiles_raw)))
-
-# project to equal-area CRS for area math
-tiles_m <- st_transform(tiles_raw, crs_area) %>%
-  st_make_valid() %>%
-  mutate(tile_area_m2 = as.numeric(st_area(geometry)))
-stopifnot(!any(st_is_empty(tiles_m)))
-
-# ---- 6) Read districts & project to same area CRS ----
-districts_ll <- districts
-if (is.na(st_crs(districts_ll))) st_crs(districts_ll) <- 4326
-stopifnot(name_col %in% names(districts_ll))
-
-districts_m <- st_transform(districts_ll, crs_area) %>%
-  st_make_valid()
-stopifnot(!any(st_is_empty(districts_m)))
-
-# ---- 7) Tile→District area fractions (for areal split) ----
-ix <- st_intersection(
-  tiles_m %>% select(xtile, ytile, tile_area_m2),
-  districts_m %>% select(all_of(name_col))
-) %>%
-  mutate(ix_area_m2 = as.numeric(st_area(geometry)),
-         frac = ifelse(tile_area_m2 > 0, ix_area_m2 / tile_area_m2, 0)) %>%
-  st_drop_geometry() %>%
-  rename(district = !!name_col)
-
-tile2dist <- ix %>% select(xtile, ytile, district, frac)
-
-# ---- 8) Distribute tile->tile flows into district->district flows ----
-# join origin fractions
-flows_o <- tile_flows %>%
-  left_join(tile2dist, by = c("o_xtile" = "xtile", "o_ytile" = "ytile")) %>%
-  rename(o_district = district, o_frac = frac) %>%
-  filter(!is.na(o_district), o_frac > 0)
-
-# join destination fractions
-flows_od <- flows_o %>%
-  left_join(tile2dist, by = c("d_xtile" = "xtile", "d_ytile" = "ytile")) %>%
-  rename(d_district = district, d_frac = frac) %>%
-  filter(!is.na(d_district), d_frac > 0)
-
-# final district->district flows (TOTALS, partial tiles handled)
-dist2dist <- flows_od %>%
-  mutate(flow = weight * o_frac * d_frac) %>%
-  group_by(o_district, d_district) %>%
-  summarise(flow = sum(flow, na.rm = TRUE), .groups = "drop") %>%
-  filter(flow > 0)
-
+## save output (unchanged file targets; rename if you want to distinguish weighted)
+if (!dir.exists("data")) dir.create("data")
+st_write(districts_with_activity, "data/Costa_Rica_districts_activity.gpkg", delete_dsn = TRUE)
 ```
 
