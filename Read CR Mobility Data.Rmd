@@ -326,13 +326,6 @@ st_write(squares_ll, "data/costa_rica_activity_tiles.gpkg", delete_dsn = TRUE)
 
 ```{r}
 
-## --- Read in activity data ---
-setwd("~/Downloads")
-ca_data <- read.csv("all_processed_combined.csv")
-
-library(sf)
-library(dplyr)
-
 ## --- Use your calculated tiles in pop_tiles ---
 # pop_tiles must be sf with a polygon geometry
 # and a population column we'll use for weighting.
@@ -458,15 +451,52 @@ leaflet(tile_activity_lonlat) %>%
   addLegend(pal = pal, values = ~activity, title = "Activity Level", position = "bottomright")
 
  
+library(dplyr)
+library(ggplot2)
+library(sf)
+
+# --- 0) (Optional) pick a subset of ds if there are many ---
+# e.g., the 6 most recent ds values
+# tile_activity_by_ds_sf <- tile_activity_by_ds_sf %>%
+#   mutate(ds = as.Date(ds)) %>%
+#   arrange(ds) %>%
+#   group_by(tile_id) %>% ungroup() %>%
+#   filter(ds %in% tail(sort(unique(ds)), 6))
+
+# --- 1) Choose mapping variable: raw or log1p ---
+df_map <- tile_activity_by_ds_sf %>%
+  mutate(activity_log1p = log1p(activity))
+
+# Use raw:
+#value_col <- "activity"
+# Or use log1p (uncomment the next line and comment the one above):
+ value_col <- "activity_log1p"
+
+# --- 2) Global limits so colors are comparable across facets ---
+vrng <- range(df_map[[value_col]], na.rm = TRUE)
+
+# --- 3) Nice labels for legend ---
+leg_title <- if (value_col == "activity") "Activity (pop-weighted)" else "log(1 + activity)"
+
+# --- 4) Faceted map ---
+p <- ggplot(df_map) +
+  geom_sf(aes(fill = .data[[value_col]]), color = NA) +
+  facet_wrap(~ ds) +
+  scale_fill_viridis_c(name = leg_title, limits = vrng, na.value = "transparent") +
+  coord_sf(expand = FALSE) +
+  theme_void(base_size = 11) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    legend.position = "right",
+    panel.spacing = unit(6, "pt")
+  )
+
+print(p)
+
+# --- 5) (Optional) save to file ---
+# ggsave("fig_activity_faceted_by_ds.png", p, width = 12, height = 8, dpi = 300)
 
 ```
-
-```{r}
-
-
-```
-
-
 
 
 ##Step 4. Summarize and merge with polygon boundary
@@ -569,4 +599,19 @@ pal <- colorNumeric(
 if (!dir.exists("data")) dir.create("data")
 st_write(districts_with_activity, "data/Costa_Rica_districts_activity.gpkg", delete_dsn = TRUE)
 ```
+
+
+
+###########Next things
+1. Create a matrix that shows how connected each district is to each other district
+2. Movement within district vs movement between district
+3. Median distance of travel 
+4. Connections to certain districts 
+5. Seasonal movement -> seasonal dengue
+6. Can you see movement after a natural disasaster (and then link this back to dengue)?
+   -try flooding in Nov 2024, we do not have 2024 data
+7. 
+
+
+
 
