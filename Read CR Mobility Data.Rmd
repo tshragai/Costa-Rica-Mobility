@@ -146,6 +146,189 @@ ggplot(pop_tiles) +
 
 ```
 
+Trying to fix shit
+```{r}
+
+## --- Read in activity data ---
+setwd("~/Downloads")
+ca_data <- read.csv("all_processed_combined.csv")
+
+library(dplyr)
+library(sf)
+library(geosphere)
+library(leaflet)
+
+# 1) Unique visit centroids in WGS84
+pts_ll <- st_as_sf(
+  ca_data %>% distinct(visit_longitude, visit_latitude),
+  coords = c("visit_longitude","visit_latitude"),
+  crs = 4326
+)
+
+# 2) Estimate grid step (meters) from nearest-neighbor distances
+# Pairwise distances (n ~ 1k -> ~1e6 dists is fine)
+M <- geosphere::distm(st_coordinates(pts_ll))  # meters
+diag(M) <- Inf
+nn <- apply(M, 1, min)                          # nearest neighbor for each point
+
+# Focus on plausible tile spacing (e.g., 2–20 km band). Adjust if needed.
+nn_band <- nn[nn >= 2000 & nn <= 20000]
+stopifnot(length(nn_band) > 0)
+
+grid_step_m <- median(nn_band, na.rm = TRUE)    # robust central tendency
+cat("Estimated grid step (m):", round(grid_step_m), "\n")
+
+# 3) Build squares centered on points with that side length (in a meters CRS)
+crs_proj <- 5367  # Costa Rica TM Norte (meters)
+pts_m <- st_transform(pts_ll, crs_proj)
+XY <- st_coordinates(pts_m)
+
+make_square <- function(x, y, s) {
+  half <- s/2
+  st_polygon(list(matrix(
+    c(x-half, y-half,
+      x+half, y-half,
+      x+half, y+half,
+      x-half, y+half,
+      x-half, y-half),
+    ncol = 2, byrow = TRUE
+  )))
+}
+
+squares_m <- st_sfc(
+  lapply(seq_len(nrow(XY)), function(i) make_square(XY[i,1], XY[i,2], grid_step_m)),
+  crs = crs_proj
+) |> st_sf()
+
+# 4) Sanity: areas should be ~ grid_step_m^2
+areas <- as.numeric(st_area(squares_m))
+cat("Median area (m^2):", round(median(areas)), " | expected ~", round(grid_step_m^2), "\n")
+
+# 5) To Leaflet (convert to lon/lat)
+squares_ll <- st_transform(squares_m, 4326)
+
+leaflet() %>%
+  addTiles() %>%
+  addPolygons(data = squares_ll, group = "Squares",
+              color = "#e34a33", weight = 2, opacity = 1,
+              fillColor = "#e34a33", fillOpacity = 0.35) %>%
+  addCircleMarkers(data = pts_ll, group = "Centroids",
+                   radius = 2.5, color = "#08519c", fillColor = "#08519c",
+                   fillOpacity = 1, stroke = FALSE) 
+
+
+######################
+
+library(dplyr)
+library(purrr)
+library(sf)
+library(leaflet)
+
+# ---------------------------
+# Bing / XYZ tile utilities
+# ---------------------------
+lonlat_to_tile_xyz <- function(lon, lat, z) {
+  n <- 2^z
+  x <- floor((lon + 180) / 360 * n)
+  lat_rad <- lat * pi/180
+  y <- floor((1 - log(tan(lat_rad) + 1/cos(lat_rad)) / pi) / 2 * n)
+  list(x = as.integer(x), y = as.integer(y))
+}
+
+tile_bbox_xyz <- function(x, y, z) {
+  n <- 2^z
+  lon_min <- 360 * (x / n) - 180
+  lon_max <- 360 * ((x + 1) / n) - 180
+  tile2lat <- function(ty) 180/pi * atan(sinh(pi * (1 - 2 * ty / n)))
+  lat_max <- tile2lat(y)
+  lat_min <- tile2lat(y + 1)
+  list(xmin = lon_min, ymin = lat_min, xmax = lon_max, ymax = lat_max)
+}
+
+tile_center_xyz <- function(x, y, z) {
+  b <- tile_bbox_xyz(x, y, z)
+  c(lon = (b$xmin + b$xmax)/2, lat = (b$ymin + b$ymax)/2)
+}
+
+poly_from_bbox <- function(xmin, ymin, xmax, ymax) {
+  st_polygon(list(matrix(
+    c(xmin,ymin,  xmax,ymin,  xmax,ymax,  xmin,ymax,  xmin,ymin),
+    ncol = 2, byrow = TRUE
+  )))
+}
+
+# ---------------------------
+# 1) Unique points (WGS84)
+# ---------------------------
+pts_ll <- st_as_sf(
+  ca_data %>% distinct(visit_longitude, visit_latitude),
+  coords = c("visit_longitude","visit_latitude"),
+  crs = 4326
+)
+
+# ---------------------------
+# 2) Compute Bing z=13 tiles
+# ---------------------------
+z <- 13L
+
+tiles_idx <- pts_ll %>%
+  st_coordinates() %>%
+  as.data.frame() %>%
+  rename(lon = X, lat = Y) %>%
+  rowwise() %>%
+  mutate(t = list(lonlat_to_tile_xyz(lon, lat, z)),
+         xtile = t$x, ytile = t$y) %>%
+  ungroup() %>%
+  distinct(xtile, ytile)
+
+# Polygons for those tiles (WGS84)
+bb <- pmap(tiles_idx, ~ tile_bbox_xyz(..1, ..2, z))
+bb_df <- tibble::tibble(
+  xtile = tiles_idx$xtile,
+  ytile = tiles_idx$ytile,
+  xmin  = vapply(bb, `[[`, numeric(1), "xmin"),
+  ymin  = vapply(bb, `[[`, numeric(1), "ymin"),
+  xmax  = vapply(bb, `[[`, numeric(1), "xmax"),
+  ymax  = vapply(bb, `[[`, numeric(1), "ymax")
+)
+
+tiles13_ll <- st_sf(
+  xtile = bb_df$xtile,
+  ytile = bb_df$ytile,
+  geometry = st_sfc(pmap(bb_df[,c("xmin","ymin","xmax","ymax")],
+                         ~ poly_from_bbox(..1, ..2, ..3, ..4)),
+                    crs = 4326)
+)
+
+# True centers of those tiles (WGS84)
+centers_df <- tiles_idx %>%
+  rowwise() %>%
+  mutate(c = list(tile_center_xyz(xtile, ytile, z)),
+         lon = c["lon"], lat = c["lat"]) %>%
+  ungroup()
+
+centers13_ll <- st_as_sf(centers_df, coords = c("lon","lat"), crs = 4326)
+
+# ---------------------------
+# 3) Leaflet comparison map
+# ---------------------------
+leaflet() %>%
+  addTiles() %>%
+  addPolygons(data = tiles13_ll, group = "Bing tiles z=13",
+              color = "#2c7fb8", weight = 1.5, fill = FALSE, opacity = 0.9) %>%
+  #addCircleMarkers(data = centers13_ll, group = "z=13 tile centers",
+   #                radius = 2.5, color = "#2c7fb8",
+    #               fillColor = "#2c7fb8", fillOpacity = 1, stroke = FALSE) %>%
+  addCircleMarkers(data = pts_ll, group = "ca_data centroids",
+                   radius = 2.5, color = "#111111",
+                   fillColor = "#000000", fillOpacity = 1, stroke = FALSE) #%>%
+  #addPolygons(data = squares_ll, group = "Squares",
+   #           color = "#e34a33", weight = 2, opacity = 1,
+    #          fillColor = "#e34a33", fillOpacity = 0.35) 
+  
+
+
+```
 
 
 
@@ -156,11 +339,10 @@ setwd("~/Downloads")
 ca_data <- read.csv("all_processed_combined.csv")
 
 ## set zoom levels, size of tiles around the points. 
-#If it gets changed from 13
-zoom <- 12L  # may fiddle with this (10 is way too coarse for me)
+zoom <- 13  # it looks like it has to be 13... but points are off center
 
 # pop_tiles is sf with columns: activity, sum, geometry
-# 1) rename population col
+# 1) rename population col to the population data we'll use
 pop_tiles <- pop_tiles %>% rename(population = ghsl_population_2025)
 
 # 2) get centroids in lon/lat (EPSG:4326) and compute tile indices at your zoom
@@ -185,10 +367,10 @@ orig_df <- ca_data %>%
   left_join(pop_tiles, by = c("o_xtile" = "xtile", "o_ytile" = "ytile")) %>%
   mutate(origin_pop = ifelse(is.na(population), 0, population))
 
-## summaries daytime activity
+## summaries activity
 ## (unchanged filter line kept commented)
 activity_summary <- orig_df %>% 
-  #filter(day_or_night == "daytime") %>% # may switch to night for heat-ag proj
+  #filter(day_or_night == "daytime") %>% # keep day and night
   group_by(visit_latitude, visit_longitude) %>% # only interested in visit location not home
   ## population-weighted sum over origins visiting each destination point ---
   summarise(activity = sum(visit_fraction * origin_pop, na.rm = TRUE), .groups = "drop")
