@@ -24,7 +24,7 @@ library(scales)
 
 Create tiles from lat/lon points provided by Meta
 
-```{r}
+```{r create tiles}
 
 ## --- Read in activity data ---
 setwd("~/Downloads")
