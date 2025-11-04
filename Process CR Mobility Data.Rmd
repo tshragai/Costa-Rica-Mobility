@@ -222,6 +222,9 @@ tile_activity_by_ds_ll <- st_transform(tile_activity_by_ds_sf, 4326)
 st_write(tile_activity_overall_ll, "data/activity_by_pop_tiles_overall_wgs84.geojson", delete_dsn = TRUE)
 st_write(tile_activity_by_ds_ll, "data/activity_by_pop_tiles_by_ds_wgs84.geojson", delete_dsn = TRUE)
 
+# ca_aug to use later
+st_write(ca_aug, "data/ca_aug.csv", delete_dsn = TRUE)
+
 rm(tiles_crs, visit_info,visit_sf,visit_with_tile)
 
 ```
@@ -333,6 +336,7 @@ leaflet(districts_with_activity) %>%
 ## save output 
 if (!dir.exists("data")) dir.create("data")
 st_write(districts_with_activity, "data/Costa_Rica_districts_activity.gpkg", delete_dsn = TRUE)
+st_write(districts, "data/Costa_Rica_districts.gpkg", delete_dsn = TRUE)
 
 rm(district_activity,districts_m, home_info, home_sf, home_with_pop, ix, tiles_m)
 ```
