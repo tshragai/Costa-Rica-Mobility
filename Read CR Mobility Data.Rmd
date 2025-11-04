@@ -9,9 +9,9 @@ knitr::opts_chunk$set(echo = TRUE)
 ```
 
 
-
-```{r cars}
-## upload necessary packages
+Libraries and working directory
+```{r set wd and libraries}
+## packages
 library(sf)
 library(terra)
 library(tidyverse)
@@ -21,10 +21,6 @@ library(leaflet)
 library(RColorBrewer)
 library(slippymath)
 library(scales)
-## upload shapefile -- make this whatever polygon you want to extract to could be county or census tract
-# california state parks shp (casp)
-#casp_shp <- st_read("data/raw/parks/casp_individualpark_boundaries/ParkBoundaries.shp")
-
 setwd("~/Downloads")
 ```
 
@@ -34,8 +30,9 @@ setwd("~/Downloads")
 - I only use visit_* tiles (not home_* tiles)
 - I only use daytime observations (not nighttime)
 ##Step 1. Reduce memory burden
-- the US csv file was quite large so I had to fiddle around with filtering/making sure my computer didn't explode (play around with this)
-
+- The US csv file was quite large so I had to fiddle around with filtering/making sure my computer didn't explode (play around with this)
+- This is Sam's flow to do the initial data processing
+- Only need to run this once!
 
 ```{r}
 library(data.table)
@@ -87,7 +84,7 @@ process_one <- function(input_file, output_file) {
 }
 
 # ===========================================
-##single combined output (optional)
+##single combined output 
 # ===========================================
 # Uncomment to produce one big file with all filtered rows
  combined_out <- file.path(input_dir, "all_processed_combined.csv")
@@ -111,7 +108,7 @@ process_one <- function(input_file, output_file) {
  }
 
 # ===========================================
-# MODE A: per-file outputs (recommended)
+##per-file outputs (recommended)
 # ===========================================
 # Each input 'foo.csv' -> 'foo_processed.csv' in the same folder
 for (infile in csv_files) {
@@ -121,485 +118,355 @@ for (infile in csv_files) {
 }
 ```
 
-read in population data
-```{r population data}
-setwd("~/Costa-Rica-Mobility/Data")
-pop_tiles <- st_read("costa_rica_activity_tiles_population.geojson")  
 
-#worldpop or GHSL
-pop_tiles <- pop_tiles %>%
-  mutate(population_dif = worldpop_population - ghsl_population_2025) 
+Now I'm trying to filter data to a single origin district and show connections
+Maybe download health facility data from GEE
+And we have health-facility level dengue data but it's messy? 
 
-# Map difference in values
-ggplot(pop_tiles) +
-  geom_sf(aes(fill = population_dif), color = NA) +
-  scale_fill_gradient2(
-    name = "difference in population",
-    midpoint = 0,
-    low = "#2c7bb6", mid = "white", high = "#d7191c",
-    oob = squish, limits = c(-1000, 1000)   # adjust limits as you like
-  ) +
-  labs(x = NULL, y = NULL) +
-  theme_minimal()
+ok here's what I want to do tomorrow
+make a shiny app where you can select a district and see
+two maps (travel in and travel out) by Meta pixel 
+use a base district map
+Can caroline create a suitability map to underlay? Movement+suitability
+Then bring in malaria and/or dengue data, ideally to health facility level 
+Can you predict (an preemptively treat) transmission of rare or emerging diseases? 
+Can you predict and prevent transmission of dengue at the beginning of the transmission season? 
 
-#mmmmm they're pretty different
-
-```
-
-Trying to fix shit
-```{r}
-
-## --- Read in activity data ---
-setwd("~/Downloads")
-ca_data <- read.csv("all_processed_combined.csv")
-
-# 1) Unique visit centroids in WGS84
-pts_ll <- st_as_sf(
-  ca_data %>% distinct(visit_longitude, visit_latitude),
-  coords = c("visit_longitude","visit_latitude"),
-  crs = 4326
-)
-
-# 2) Estimate grid step (meters) from nearest-neighbor distances
-# Pairwise distances (n ~ 1k -> ~1e6 dists is fine)
-M <- geosphere::distm(st_coordinates(pts_ll))  # meters
-diag(M) <- Inf
-nn <- apply(M, 1, min)                          # nearest neighbor for each point
-
-# Focus on plausible tile spacing (e.g., 2–20 km band). Adjust if needed.
-nn_band <- nn[nn >= 2000 & nn <= 20000]
-stopifnot(length(nn_band) > 0)
-
-grid_step_m <- median(nn_band, na.rm = TRUE)    # robust central tendency
-cat("Estimated grid step (m):", round(grid_step_m), "\n")
-
-# 3) Build squares centered on points with that side length (in a meters CRS)
-crs_proj <- 5367  # Costa Rica TM Norte (meters)
-pts_m <- st_transform(pts_ll, crs_proj)
-XY <- st_coordinates(pts_m)
-
-make_square <- function(x, y, s) {
-  half <- s/2
-  st_polygon(list(matrix(
-    c(x-half, y-half,
-      x+half, y-half,
-      x+half, y+half,
-      x-half, y+half,
-      x-half, y-half),
-    ncol = 2, byrow = TRUE
-  )))
-}
-
-squares_m <- st_sfc(
-  lapply(seq_len(nrow(XY)), function(i) make_square(XY[i,1], XY[i,2], grid_step_m)),
-  crs = crs_proj
-) |> st_sf()
-
-# 4) Sanity: areas should be ~ grid_step_m^2
-areas <- as.numeric(st_area(squares_m))
-cat("Median area (m^2):", round(median(areas)), " | expected ~", round(grid_step_m^2), "\n")
-
-# 5) To Leaflet (convert to lon/lat)
-squares_ll <- st_transform(squares_m, 4326)
-
-leaflet() %>%
-  addTiles() %>%
-  addPolygons(data = squares_ll, group = "Squares",
-              color = "#e34a33", weight = 2, opacity = 1,
-              fillColor = "#e34a33", fillOpacity = 0.35) %>%
-  addCircleMarkers(data = pts_ll, group = "Centroids",
-                   radius = 2.5, color = "#08519c", fillColor = "#08519c",
-                   fillOpacity = 1, stroke = FALSE) 
-
-
-## save output (unchanged file targets; rename if you want to distinguish weighted)
-if (!dir.exists("data")) dir.create("data")
-st_write(squares_ll, "data/costa_rica_activity_tiles.gpkg", delete_dsn = TRUE)
-
-######################
-
-# # ---------------------------
-# # Bing / XYZ tile utilities
-# # ---------------------------
-# lonlat_to_tile_xyz <- function(lon, lat, z) {
-#   n <- 2^z
-#   x <- floor((lon + 180) / 360 * n)
-#   lat_rad <- lat * pi/180
-#   y <- floor((1 - log(tan(lat_rad) + 1/cos(lat_rad)) / pi) / 2 * n)
-#   list(x = as.integer(x), y = as.integer(y))
-# }
-# 
-# tile_bbox_xyz <- function(x, y, z) {
-#   n <- 2^z
-#   lon_min <- 360 * (x / n) - 180
-#   lon_max <- 360 * ((x + 1) / n) - 180
-#   tile2lat <- function(ty) 180/pi * atan(sinh(pi * (1 - 2 * ty / n)))
-#   lat_max <- tile2lat(y)
-#   lat_min <- tile2lat(y + 1)
-#   list(xmin = lon_min, ymin = lat_min, xmax = lon_max, ymax = lat_max)
-# }
-# 
-# tile_center_xyz <- function(x, y, z) {
-#   b <- tile_bbox_xyz(x, y, z)
-#   c(lon = (b$xmin + b$xmax)/2, lat = (b$ymin + b$ymax)/2)
-# }
-# 
-# poly_from_bbox <- function(xmin, ymin, xmax, ymax) {
-#   st_polygon(list(matrix(
-#     c(xmin,ymin,  xmax,ymin,  xmax,ymax,  xmin,ymax,  xmin,ymin),
-#     ncol = 2, byrow = TRUE
-#   )))
-# }
-# 
-# # ---------------------------
-# # 1) Unique points (WGS84)
-# # ---------------------------
-# pts_ll <- st_as_sf(
-#   ca_data %>% distinct(visit_longitude, visit_latitude),
-#   coords = c("visit_longitude","visit_latitude"),
-#   crs = 4326
-# )
-# 
-# # ---------------------------
-# # 2) Compute Bing z=13 tiles
-# # ---------------------------
-# z <- 13L
-# 
-# tiles_idx <- pts_ll %>%
-#   st_coordinates() %>%
-#   as.data.frame() %>%
-#   rename(lon = X, lat = Y) %>%
-#   rowwise() %>%
-#   mutate(t = list(lonlat_to_tile_xyz(lon, lat, z)),
-#          xtile = t$x, ytile = t$y) %>%
-#   ungroup() %>%
-#   distinct(xtile, ytile)
-# 
-# # Polygons for those tiles (WGS84)
-# bb <- pmap(tiles_idx, ~ tile_bbox_xyz(..1, ..2, z))
-# bb_df <- tibble::tibble(
-#   xtile = tiles_idx$xtile,
-#   ytile = tiles_idx$ytile,
-#   xmin  = vapply(bb, `[[`, numeric(1), "xmin"),
-#   ymin  = vapply(bb, `[[`, numeric(1), "ymin"),
-#   xmax  = vapply(bb, `[[`, numeric(1), "xmax"),
-#   ymax  = vapply(bb, `[[`, numeric(1), "ymax")
-# )
-# 
-# tiles13_ll <- st_sf(
-#   xtile = bb_df$xtile,
-#   ytile = bb_df$ytile,
-#   geometry = st_sfc(pmap(bb_df[,c("xmin","ymin","xmax","ymax")],
-#                          ~ poly_from_bbox(..1, ..2, ..3, ..4)),
-#                     crs = 4326)
-# )
-# 
-# # True centers of those tiles (WGS84)
-# centers_df <- tiles_idx %>%
-#   rowwise() %>%
-#   mutate(c = list(tile_center_xyz(xtile, ytile, z)),
-#          lon = c["lon"], lat = c["lat"]) %>%
-#   ungroup()
-# 
-# centers13_ll <- st_as_sf(centers_df, coords = c("lon","lat"), crs = 4326)
-# 
-# # ---------------------------
-# # 3) Leaflet comparison map
-# # ---------------------------
-# leaflet() %>%
-#   addTiles() %>%
-#   addPolygons(data = tiles13_ll, group = "Bing tiles z=13",
-#               color = "#2c7fb8", weight = 1.5, fill = FALSE, opacity = 0.9) %>%
-#   #addCircleMarkers(data = centers13_ll, group = "z=13 tile centers",
-#    #                radius = 2.5, color = "#2c7fb8",
-#     #               fillColor = "#2c7fb8", fillOpacity = 1, stroke = FALSE) %>%
-#   addCircleMarkers(data = pts_ll, group = "ca_data centroids",
-#                    radius = 2.5, color = "#111111",
-#                    fillColor = "#000000", fillOpacity = 1, stroke = FALSE) #%>%
-#   #addPolygons(data = squares_ll, group = "Squares",
-#    #           color = "#e34a33", weight = 2, opacity = 1,
-#     #          fillColor = "#e34a33", fillOpacity = 0.35) 
-#   
-
-
-```
 
 ```{r}
+library(mapdeck)
+library(stringi)
+mapdeck::set_token("pk.eyJ1IjoidHNocmFnYWkiLCJhIjoiY21oam84d2JtMWRnOTJpcTY0Mm9uamVmaCJ9.G1P5tS1f60KuJBKTkM-9lQ")
+mapdeck_tokens()
 
-## --- Use your calculated tiles in pop_tiles ---
-# pop_tiles must be sf with a polygon geometry
-# and a population column we'll use for weighting.
-pop_tiles <- pop_tiles %>%
-  dplyr::rename(population = ghsl_population_2025)
+# normalize strings for matching
+norm_str <- function(x) stri_trans_general(x, "Latin-ASCII") |> toupper() |> trimws()
+target_name <- "SARAPIQUI"       # adjust if your shapefile uses another spelling
+name_col    <- "NOMB_UGED"       # district name field in your `districts`
 
-# Ensure pop_tiles has a unique tile id
-if (!("tile_id" %in% names(pop_tiles))) {
-  pop_tiles <- pop_tiles %>% dplyr::mutate(tile_id = dplyr::row_number())
+# Sarapiquí polygon (outline + context fill)
+sar_poly <- districts %>%
+  mutate(norm = norm_str(.data[[name_col]])) %>%
+  filter(norm == target_name) %>%
+  st_transform(4326)
+
+# Tiles that fall inside the district (faint backdrop polygons)
+tiles_in_district <- st_intersection(st_transform(pop_tiles, 4326), sar_poly) %>%
+  select(tile_id)
+
+# One centroid per tile (for arc endpoints), from existing pop_tiles
+tile_centroids <- pop_tiles %>%
+  st_transform(4326) %>%
+  st_centroid() %>%
+  transmute(tile_id,
+            Lon = st_coordinates(geometry)[,1],
+            Lat = st_coordinates(geometry)[,2]) %>%
+  st_drop_geometry()
+
+# Ensure weight column exists from your previous step
+if (!"weight" %in% names(ca_aug)) {
+  ca_aug <- ca_aug %>% mutate(weight = visit_fraction * origin_pop)
 }
 
-tiles_crs <- st_crs(pop_tiles)
+#comput origin and destination disitrcts
+# make sure everything uses the same CRS
+tiles_crs <- st_crs(districts)
 
-## --- 1) Attach ORIGIN population by spatial join ---
-home_sf <- st_as_sf(
-  ca_data,
+# create sf objects for origins and destinations
+origins_sf <- st_as_sf(
+  ca_aug,
   coords = c("home_longitude", "home_latitude"),
   crs = 4326, remove = FALSE
 ) %>% st_transform(tiles_crs)
 
-home_with_pop <- st_join(
-  home_sf, pop_tiles[, c("tile_id","population")],
-  join = st_within, left = TRUE
-)
-
-home_with_pop$origin_pop <- ifelse(is.na(home_with_pop$population), 0, home_with_pop$population)
-home_with_pop$o_tile_id  <- home_with_pop$tile_id
-
-home_info <- home_with_pop %>%
-  st_drop_geometry() %>%
-  dplyr::select(o_tile_id, origin_pop)
-
-stopifnot(nrow(home_info) == nrow(ca_data))
-ca_aug <- bind_cols(ca_data, home_info)
-
-## --- 2) Assign DESTINATION tile (visit point -> destination tile) ---
-visit_sf <- st_as_sf(
+dest_sf <- st_as_sf(
   ca_aug,
   coords = c("visit_longitude", "visit_latitude"),
   crs = 4326, remove = FALSE
 ) %>% st_transform(tiles_crs)
 
-visit_with_tile <- st_join(
-  visit_sf, pop_tiles[, c("tile_id")],
-  join = st_within, left = TRUE
-)
+# join with district polygons to find which district each point falls in
+origins_joined <- st_join(origins_sf, districts[, c("NOMB_UGED")], left = TRUE)
+dests_joined   <- st_join(dest_sf,   districts[, c("NOMB_UGED")], left = TRUE)
 
-visit_info <- visit_with_tile %>%
-  st_drop_geometry() %>%
-  dplyr::mutate(d_tile_id = tile_id) %>%
-  dplyr::select(d_tile_id)
+# extract just the district names, keeping row order
+origin_districts <- st_drop_geometry(origins_joined) %>%
+  transmute(origin_district = NOMB_UGED)
 
-stopifnot(nrow(visit_info) == nrow(ca_aug))
-ca_aug <- bind_cols(ca_aug, visit_info)
+dest_districts <- st_drop_geometry(dests_joined) %>%
+  transmute(dest_district = NOMB_UGED)
 
-## --- 3) Summarize population-weighted activity per destination tile ---
-# Optional filter if you want only daytime:
-# ca_aug <- dplyr::filter(ca_aug, day_or_night == "daytime")
-
-### (A) Overall activity
-tile_activity_overall <- ca_aug %>%
-  dplyr::filter(!is.na(d_tile_id)) %>%
-  dplyr::mutate(weighted_activity = visit_fraction * origin_pop) %>%
-  dplyr::group_by(d_tile_id) %>%
-  dplyr::summarise(activity = sum(weighted_activity, na.rm = TRUE), .groups = "drop")
-
-### (B) Activity by ds
-tile_activity_by_ds <- ca_aug %>%
-  dplyr::filter(!is.na(d_tile_id)) %>%
-  dplyr::mutate(weighted_activity = visit_fraction * origin_pop) %>%
-  dplyr::group_by(d_tile_id, ds) %>%
-  dplyr::summarise(activity = sum(weighted_activity, na.rm = TRUE), .groups = "drop")
-
-## --- 4) Attach geometry (destination tiles) ---
-tile_activity_overall_sf <- pop_tiles %>%
-  dplyr::select(tile_id, geometry) %>%
-  dplyr::right_join(tile_activity_overall, by = c("tile_id" = "d_tile_id"))
-
-tile_activity_by_ds_sf <- pop_tiles %>%
-  dplyr::select(tile_id, geometry) %>%
-  dplyr::right_join(tile_activity_by_ds, by = c("tile_id" = "d_tile_id"))
-
-## --- 5) Save outputs ---
-if (!dir.exists("data")) dir.create("data")
-
-st_write(tile_activity_overall_sf, "data/activity_by_pop_tiles_overall.gpkg", delete_dsn = TRUE)
-st_write(tile_activity_by_ds_sf, "data/activity_by_pop_tiles_by_ds.gpkg", delete_dsn = TRUE)
-
-# Optionally, also WGS84 for leaflet
-tile_activity_overall_ll <- st_transform(tile_activity_overall_sf, 4326)
-tile_activity_by_ds_ll <- st_transform(tile_activity_by_ds_sf, 4326)
-
-st_write(tile_activity_overall_ll, "data/activity_by_pop_tiles_overall_wgs84.geojson", delete_dsn = TRUE)
-st_write(tile_activity_by_ds_ll, "data/activity_by_pop_tiles_by_ds_wgs84.geojson", delete_dsn = TRUE)
-
-```
+# add them back to your main data frame
+ca_aug <- bind_cols(ca_aug, origin_districts, dest_districts)
 
 
-##Step 3. Plot it in Leaflet
-```{r}
 
-tile_activity_lonlat<-tile_activity_ll%>%
-  mutate(activity_log=log(activity+1))
+# OUTGOING: origin must be in district; destination anywhere
+flows_out <- ca_aug %>%
+  mutate(origin_norm = norm_str(origin_district)) %>%
+  filter(origin_norm == target_name, !is.na(o_tile_id), !is.na(d_tile_id)) %>%
+  group_by(o_tile_id, d_tile_id) %>%
+  summarise(weight = sum(weight, na.rm = TRUE), .groups = "drop")
 
-# create color scale
-pal <- colorNumeric("YlOrRd", domain = tile_activity_lonlat$activity_log, na.color = "transparent")
-## create leaflet map
-leaflet(tile_activity_lonlat) %>% 
-  addTiles() %>% 
-  addPolygons(fillColor = ~pal(activity_log),
-              weight = 1, color = "black", fillOpacity = 0.7,
-              popup = ~paste0("Activity", round(activity, 3))) %>% 
-  addLegend(pal = pal, values = ~activity, title = "Activity Level", position = "bottomright")
+# INCOMING: destination must be in district; origin anywhere
+flows_in <- ca_aug %>%
+  mutate(dest_norm = norm_str(dest_district)) %>%
+  filter(dest_norm == target_name, !is.na(o_tile_id), !is.na(d_tile_id)) %>%
+  group_by(o_tile_id, d_tile_id) %>%
+  summarise(weight = sum(weight, na.rm = TRUE), .groups = "drop")
 
-# create color scale
-pal <- colorNumeric("YlOrRd", domain = tile_activity_lonlat$activity, na.color = "transparent")
-## create leaflet map
-leaflet(tile_activity_lonlat) %>% 
-  addTiles() %>% 
-  addPolygons(fillColor = ~pal(activity),
-              weight = 1, color = "black", fillOpacity = 0.7,
-              popup = ~paste0("Activity", round(activity, 3))) %>% 
-  addLegend(pal = pal, values = ~activity, title = "Activity Level", position = "bottomright")
+# helper: attach centroids and build the arc df mapdeck expects
+prep_arc_df <- function(flows, cents) {
+  df <- flows %>%
+    left_join(cents %>% rename(o_tile_id = tile_id, Lon.home = Lon, Lat.home = Lat),
+              by = "o_tile_id") %>%
+    left_join(cents %>% rename(d_tile_id = tile_id, Lon = Lon, Lat = Lat),
+              by = "d_tile_id") %>%
+    filter(is.finite(Lon.home), is.finite(Lat.home), is.finite(Lon), is.finite(Lat),
+           o_tile_id != d_tile_id) %>%
+    mutate(
+      w_log    = log1p(weight),
+      stroke_w = rescale(w_log, to = c(1, 8), from = range(w_log, na.rm = TRUE)),
+      # continuous color by weight (viridis palette via scales::col_numeric + viridisLite)
+      color    = viridisLite::viridis(100)[as.integer(rescale(w_log, to = c(1, 100)))],
+      tooltip  = sprintf(
+        "OD tiles: %s → %s<br/>Weight: %.3f",
+        o_tile_id, d_tile_id, weight
+      )
+    )
+  df
+}
 
- 
-library(dplyr)
-library(ggplot2)
-library(sf)
+loc.df.out <- prep_arc_df(flows_out, tile_centroids)
+loc.df.in  <- prep_arc_df(flows_in,  tile_centroids)
 
-# --- 0) (Optional) pick a subset of ds if there are many ---
-# e.g., the 6 most recent ds values
-# tile_activity_by_ds_sf <- tile_activity_by_ds_sf %>%
-#   mutate(ds = as.Date(ds)) %>%
-#   arrange(ds) %>%
-#   group_by(tile_id) %>% ungroup() %>%
-#   filter(ds %in% tail(sort(unique(ds)), 6))
+# Optional: throttle tiny flows to declutter (quantile cut)
+# q_out <- quantile(loc.df.out$weight, 0.90, na.rm = TRUE); loc.df.out <- loc.df.out %>% filter(weight >= q_out)
+# q_in  <- quantile(loc.df.in$weight,  0.90, na.rm = TRUE); loc.df.in  <- loc.df.in  %>% filter(weight >= q_in)
 
-# --- 1) Choose mapping variable: raw or log1p ---
-df_map <- tile_activity_by_ds_sf %>%
-  mutate(activity_log1p = log1p(activity))
+# Backdrop polygon layer wants a 'color' column; give a faint fixed color
+clust_out <- tiles_in_district %>% mutate(color = "#31a354")
+clust_in  <- tiles_in_district %>% mutate(color = "#3182bd")
 
-# Use raw:
-#value_col <- "activity"
-# Or use log1p (uncomment the next line and comment the one above):
- value_col <- "activity_log1p"
+# target and helper (same as before)
+norm_str   <- function(x) stri_trans_general(x, "Latin-ASCII") |> toupper() |> trimws()
+target_name <- "SARAPIQUI"      # change if needed
+name_col    <- "NOMB_UGED"      # district name field in your shapefile
 
-# --- 2) Global limits so colors are comparable across facets ---
-vrng <- range(df_map[[value_col]], na.rm = TRUE)
+# all districts (background) + target district (highlight)
+districts_full <- st_transform(districts, 4326)
 
-# --- 3) Nice labels for legend ---
-leg_title <- if (value_col == "activity") "Activity (pop-weighted)" else "log(1 + activity)"
+sar_poly <- districts_full %>%
+  mutate(norm = norm_str(.data[[name_col]])) %>%
+  filter(norm == target_name)
 
-# --- 4) Faceted map ---
-p <- ggplot(df_map) +
-  geom_sf(aes(fill = .data[[value_col]]), color = NA) +
-  facet_wrap(~ ds) +
-  scale_fill_viridis_c(name = leg_title, limits = vrng, na.value = "transparent") +
-  coord_sf(expand = FALSE) +
-  theme_void(base_size = 11) +
-  theme(
-    strip.text = element_text(face = "bold"),
-    legend.position = "right",
-    panel.spacing = unit(6, "pt")
-  )
-
-print(p)
-
-# --- 5) (Optional) save to file ---
-# ggsave("fig_activity_faceted_by_ds.png", p, width = 12, height = 8, dpi = 300)
-
-```
-
-
-##Step 4. Summarize and merge with polygon boundary
-- your CRS might be different (play around with st_valid() etc)
-```{r}
-#read in Costa Rica district data 
-setwd("~/Downloads/CR_district_population_GHSL_2025")
-districts <- st_read("CR_district_population_GHSL_2025.shp") %>%
-  st_make_valid()
-
-# Pick the column that identifies each district (edit this if different)
-name_col <- "NOMB_UGED"   # e.g., "DISTRITO", "NAME", etc.
-
-# Make sure districts share CRS with tiles for mapping
-districts <- st_transform(districts, st_crs(tile_activity_lonlat))
-
-# --- 2) Compute totals per district using area-aware overlay ---
-# Work in a projected CRS for correct area math
-tiles_m   <- st_transform(tile_activity_ll, 3857) %>%
-  mutate(
-    tile_area_m2     = as.numeric(st_area(geometry)),
-    activity_density = activity / tile_area_m2   # activity per m^2
-  )
-
-districts_m <- st_transform(districts, 3857) %>%
-  mutate(district_area_m2 = as.numeric(st_area(geometry)))
-
-# Intersect tiles and districts
-ix <- st_intersection(
-  tiles_m %>% select(activity_density),
-  districts_m %>% select(all_of(name_col), district_area_m2)
-) %>%
-  mutate(ix_area_m2 = as.numeric(st_area(geometry)))
-
-# Summarize per district
-district_activity <- ix %>%
-  st_drop_geometry() %>%
-  group_by(.data[[name_col]]) %>%
-  summarise(
-    total_activity           = sum(activity_density * ix_area_m2, na.rm = TRUE),        # ∑ density × area
-    mean_activity_density_aw = total_activity / first(district_area_m2),                # area-weighted mean
-    max_tile_density         = max(activity_density, na.rm = TRUE),                     # optional: max density tile overlapping district
-    sd_tile_density          = sd(activity_density,  na.rm = TRUE),                     # optional: sd of tile densities
-    .groups = "drop"
-  )
-
-# --- 3) Join back to polygons for mapping/exports ---
-districts_with_activity <- districts %>%
-  left_join(district_activity, by = setNames(name_col, name_col))
-
-# Example: map with leaflet (uses lon/lat CRS)
-pal <- colorNumeric("YlOrRd", domain = log(districts_with_activity$total_activity+1))
- leaflet(districts_with_activity) %>%
-   addTiles() %>%
-   addPolygons(fillColor = ~pal(log(total_activity+1)), color = "#333", weight = 0.5,
-               fillOpacity = 0.7
-               ) 
-
-
- 
- 
- # log-transform then stretch domain
-vals <- log1p(districts_with_activity$total_activity)
-pal <- colorNumeric(
-  palette = "YlOrRd",
-  domain  = range(vals, na.rm = TRUE),
-  na.color = "transparent"
-)
-
-leaflet(districts_with_activity) %>%
-  addTiles() %>%
-  addPolygons(
-    fillColor   = ~pal(log1p(total_activity)),
-    color       = "#333",
-    weight      = 0.5,
-    fillOpacity = 0.8
+## -------- Map A: ORIGIN in district (→ anywhere) --------
+tripmap_out <- mapdeck(style = mapdeck_style("dark"), pitch = 45) %>%
+  # BACKDROP: all districts, subtle
+  add_polygon(
+    data          = districts_full,
+    stroke_colour = "#666666",
+    stroke_width  = 1,
+    fill_colour   = "#222222",
+    fill_opacity  = 0.08
   ) %>%
-  addLegend(
-    pal     = pal,
-    values  = vals,
-    title   = "log(total activity + 1)",
-    position = "bottomright"
+  # HIGHLIGHT: target district on top
+  #add_polygon(
+   # data          = sar_poly,
+    #stroke_colour = "#FFD166",
+    #stroke_width  = 6,
+    #fill_colour   = "#FFD166",
+    #fill_opacity  = 0.25
+  #) %>%
+  # arcs & points (unchanged)
+  add_arc(
+    data         = loc.df.out,
+    layer_id     = "arc_layer_out",
+    origin       = c("Lon.home", "Lat.home"),
+    destination  = c("Lon", "Lat"),
+    stroke_from  = "#FFFFFF",
+    stroke_to    = "color",
+    stroke_width = "stroke_w",
+    brush_radius = 610,
+    tooltip      = "tooltip",
+    legend       = TRUE,
+    legend_options = list(
+      stroke_to = list(title = "Flow weight (log-scaled)"),
+      css = "max-height: 120px;"
+    )
+  ) %>%
+  add_scatterplot(
+    data        = loc.df.out,
+    layer_id    = "origin_pts_out",
+    lat         = "Lat.home",
+    lon         = "Lon.home",
+    fill_colour = "grey",
+    radius      = 15,
+    legend      = FALSE
   )
 
-vals <- log1p(districts_with_activity$total_activity)
-pal <- colorBin(
-  palette = "YlOrRd",
-  domain  = vals,
-  bins    = 7,          # fewer bins = bigger visible jumps
-  na.color = "transparent"
+## -------- Map B: DESTINATION in district (← anywhere) --------
+tripmap_in <- mapdeck(style = mapdeck_style("dark"), pitch = 45) %>%
+  # BACKDROP: all districts, subtle
+  add_polygon(
+    data          = districts_full,
+    stroke_colour = "#666666",
+    stroke_width  = 1,
+    fill_colour   = "#222222",
+    fill_opacity  = 0.08
+  ) %>%
+  # HIGHLIGHT: target district on top
+ # add_polygon(
+  #  data          = sar_poly,
+   # stroke_colour = "#8EC1FF",
+  #  stroke_width  = 6,
+  #  fill_colour   = "#8EC1FF",
+   # fill_opacity  = 0.25
+  #) %>%
+  # arcs & points (unchanged)
+  add_arc(
+    data         = loc.df.in,
+    layer_id     = "arc_layer_in",
+    origin       = c("Lon.home", "Lat.home"),
+    destination  = c("Lon", "Lat"),
+    stroke_from  = "#FFFFFF",
+    stroke_to    = "color",
+    stroke_width = "stroke_w",
+    brush_radius = 610,
+    tooltip      = "tooltip",
+    legend       = TRUE,
+    legend_options = list(
+      stroke_to = list(title = "Flow weight (log-scaled)"),
+      css = "max-height: 120px;"
+    )
+  ) %>%
+  add_scatterplot(
+    data        = loc.df.in,
+    layer_id    = "dest_pts_in",
+    lat         = "Lat",
+    lon         = "Lon",
+    fill_colour = "grey",
+    radius      = 15,
+    legend      = FALSE
+  )
+
+tripmap_out
+tripmap_in
+
+
+
+##########################################
+# ----- 1) Backdrop layers: grey fill + crisp outlines -----
+districts_grey <- districts_full %>%
+  st_transform(4326) %>%
+  mutate(fill_hex   = "#EAEAEA")
+
+districts_lines <- districts_full %>%
+  st_transform(4326) %>%
+  st_make_valid() %>%
+  st_boundary() %>%
+  st_cast("MULTILINESTRING") %>%
+  st_as_sf() %>%
+  mutate(stroke_hex = "#555555")
+
+# Country bbox (nice to frame the view)
+bbox_cr <- st_bbox(districts_full %>% st_transform(4326))
+
+# ----- 2) Focal tiles inside district + OUTGOING weight per ORIGIN tile -----
+tiles_in_district <- st_intersection(st_transform(pop_tiles, 4326), sar_poly) %>%
+  select(tile_id)
+
+tile_out_weights <- flows_out %>%
+  group_by(o_tile_id) %>%
+  summarise(out_weight = sum(weight, na.rm = TRUE), .groups = "drop")
+
+tiles_out_fill <- tiles_in_district %>%
+  left_join(tile_out_weights, by = c("tile_id" = "o_tile_id")) %>%
+  mutate(out_weight = ifelse(is.na(out_weight), 0, out_weight))
+
+# ----- 3) Map (only legend = out_weight) -----
+
+tripmap_out <- mapdeck(
+  style    = "mapbox://styles/mapbox/streets-v12",
+  location = c(-84.09, 9.93),
+  zoom     = 6,
+  pitch    = 45
+) %>%
+  # B) crisp outlines
+  add_path(
+    data           = districts_lines,
+    layer_id       = "districts_outline",
+    stroke_colour  = "stroke_hex",
+    stroke_width   = 1.5,
+    stroke_opacity = 0.9,
+    legend         = FALSE
+  ) %>%
+  # C) focal district tiles colored by OUTGOING weight
+  add_polygon(
+    data          = tiles_out_fill,
+    layer_id      = "focal_tiles_out",
+    stroke_colour = "#F2A900",
+    stroke_width  = 0.7,
+    fill_colour   = "out_weight",
+    fill_opacity  = 0.70,
+    palette       = "viridis",
+    legend        = TRUE,
+    legend_options = list(
+      fill_colour = list(title = "Outgoing flow (out_weight)")
+    )
+  ) %>%
+  # D) arcs from origin tiles inside district to anywhere (no legend)
+  add_arc(
+    data         = loc.df.out,
+    layer_id     = "arc_layer_out",
+    origin       = c("Lon.home","Lat.home"),
+    destination  = c("Lon","Lat"),
+    stroke_from  = "#FFFFFF",
+    stroke_to    = "color",
+    stroke_width = "stroke_w",
+    brush_radius = 610,
+    tooltip      = "tooltip",
+    legend       = FALSE
+  ) %>%
+  # E) optional: plot origin tile points (no legend)
+  add_scatterplot(
+    data        = loc.df.out,
+    layer_id    = "origin_pts_out",
+    lat         = "Lat.home",
+    lon         = "Lon.home",
+    fill_colour = "grey",
+    radius      = 15,
+    legend      = FALSE
+  ) 
+tripmap_out
+
+
+
+########
+library(manipulate)
+library(mapdeck)
+
+manipulate(
+  {
+    mapdeck(
+      style    = "mapbox://styles/mapbox/streets-v12",
+      location = c(-84.09, 9.93),
+      zoom     = 6,
+      pitch    = pitch
+    ) %>%
+      add_arc(
+        data = loc.df.out,
+        origin = c("Lon.home","Lat.home"),
+        destination = c("Lon","Lat"),
+        stroke_from = "#FFFFFF",
+        stroke_to = "color",
+        stroke_width = "stroke_w"
+      )
+  },
+  pitch = slider(0, 60, step = 5, initial = 45, label = "Map pitch")
 )
 
-pal <- colorNumeric(
-  palette = "viridis",   # or "magma", "plasma", "viridis"
-  domain  = log1p(districts_with_activity$total_activity),
-  na.color = "transparent"
-)
-
-## save output (unchanged file targets; rename if you want to distinguish weighted)
-if (!dir.exists("data")) dir.create("data")
-st_write(districts_with_activity, "data/Costa_Rica_districts_activity.gpkg", delete_dsn = TRUE)
 ```
-
 
 
 ###########Next things
