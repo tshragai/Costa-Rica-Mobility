@@ -1,0 +1,338 @@
+---
+title: "Process CR Mobility Data"
+output: html_document
+date: "2025-11-04"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Libraries 
+```{r set wd and libraries}
+## packages
+library(sf)
+library(terra)
+library(tidyverse)
+library(tigris)
+library(data.table)
+library(leaflet)
+library(RColorBrewer)
+library(slippymath)
+library(scales)
+```
+
+Create tiles from lat/lon points provided by Meta
+
+```{r}
+
+## --- Read in activity data ---
+setwd("~/Downloads")
+ca_data <- read.csv("all_processed_combined.csv")
+
+# 1) Unique visit centroids in WGS84
+pts_ll <- st_as_sf(
+  ca_data %>% distinct(visit_longitude, visit_latitude),
+  coords = c("visit_longitude","visit_latitude"),
+  crs = 4326
+)
+
+# 2) Estimate grid step (meters) from nearest-neighbor distances
+# Pairwise distances (n ~ 1k -> ~1e6 dists is fine)
+M <- geosphere::distm(st_coordinates(pts_ll))  # meters
+diag(M) <- Inf
+nn <- apply(M, 1, min)                          # nearest neighbor for each point
+
+# Focus on plausible tile spacing (e.g., 2–20 km band). Adjust if needed.
+nn_band <- nn[nn >= 2000 & nn <= 20000]
+stopifnot(length(nn_band) > 0)
+
+grid_step_m <- median(nn_band, na.rm = TRUE)    # robust central tendency
+cat("Estimated grid step (m):", round(grid_step_m), "\n")
+
+# 3) Build squares centered on points with that side length (in a meters CRS)
+crs_proj <- 5367  # Costa Rica TM Norte (meters)
+pts_m <- st_transform(pts_ll, crs_proj)
+XY <- st_coordinates(pts_m)
+
+make_square <- function(x, y, s) {
+  half <- s/2
+  st_polygon(list(matrix(
+    c(x-half, y-half,
+      x+half, y-half,
+      x+half, y+half,
+      x-half, y+half,
+      x-half, y-half),
+    ncol = 2, byrow = TRUE
+  )))
+}
+
+squares_m <- st_sfc(
+  lapply(seq_len(nrow(XY)), function(i) make_square(XY[i,1], XY[i,2], grid_step_m)),
+  crs = crs_proj
+) |> st_sf()
+
+# 4) Sanity: areas should be ~ grid_step_m^2
+areas <- as.numeric(st_area(squares_m))
+cat("Median area (m^2):", round(median(areas)), " | expected ~", round(grid_step_m^2), "\n")
+
+# 5) To Leaflet (convert to lon/lat)
+squares_ll <- st_transform(squares_m, 4326)
+
+leaflet() %>%
+  addTiles() %>%
+  addPolygons(data = squares_ll, group = "Squares",
+              color = "#e34a33", weight = 2, opacity = 1,
+              fillColor = "#e34a33", fillOpacity = 0.35) %>%
+  addCircleMarkers(data = pts_ll, group = "Centroids",
+                   radius = 2.5, color = "#08519c", fillColor = "#08519c",
+                   fillOpacity = 1, stroke = FALSE) 
+
+
+## save output (unchanged file targets; rename if you want to distinguish weighted)
+if (!dir.exists("data")) dir.create("data")
+st_write(squares_ll, "data/costa_rica_activity_tiles.gpkg", delete_dsn = TRUE)
+
+rm(M, pts_ll, pts_m, squares_ll, squares_m, XY)
+```
+
+
+read in population data, created in Python/GEE using GHSL and WorldPop
+```{r population data}
+setwd("~/Costa-Rica-Mobility/Data")
+pop_tiles <- st_read("costa_rica_activity_tiles_population.geojson")  
+
+#worldpop or GHSL
+pop_tiles <- pop_tiles %>%
+  mutate(population_dif = worldpop_population - ghsl_population_2025) 
+
+# Map difference in values
+ggplot(pop_tiles) +
+  geom_sf(aes(fill = population_dif), color = NA) +
+  scale_fill_gradient2(
+    name = "difference in population",
+    midpoint = 0,
+    low = "#2c7bb6", mid = "white", high = "#d7191c",
+    oob = squish, limits = c(-1000, 1000)   # adjust limits as you like
+  ) +
+  labs(x = NULL, y = NULL) +
+  theme_minimal()
+
+#mmmmm they're pretty different
+#we're going to go with GHSL
+
+```
+
+
+Calculate activity per tile using population values as weights
+```{r}
+
+## --- Use your calculated tiles in pop_tiles ---
+# use the GHSL pop data
+pop_tiles <- pop_tiles %>%
+  dplyr::rename(population = ghsl_population_2025)
+
+# Ensure pop_tiles has a unique tile id
+if (!("tile_id" %in% names(pop_tiles))) {
+  pop_tiles <- pop_tiles %>% dplyr::mutate(tile_id = dplyr::row_number())
+}
+
+#pull out the crs for the pop_tiles data
+tiles_crs <- st_crs(pop_tiles)
+
+## --- Attach ORIGIN population by spatial join ---
+home_sf <- st_as_sf(
+  ca_data,
+  coords = c("home_longitude", "home_latitude"),
+  crs = 4326, remove = FALSE
+) %>% st_transform(tiles_crs)
+
+home_with_pop <- st_join(
+  home_sf, pop_tiles[, c("tile_id","population")],
+  join = st_within, left = TRUE
+)
+
+home_with_pop$origin_pop <- ifelse(is.na(home_with_pop$population), 0, home_with_pop$population)
+home_with_pop$o_tile_id  <- home_with_pop$tile_id
+
+home_info <- home_with_pop %>%
+  st_drop_geometry() %>%
+  dplyr::select(o_tile_id, origin_pop)
+
+stopifnot(nrow(home_info) == nrow(ca_data))
+ca_aug <- bind_cols(ca_data, home_info)
+
+## --- Assign DESTINATION tile (visit point -> destination tile) ---
+visit_sf <- st_as_sf(
+  ca_aug,
+  coords = c("visit_longitude", "visit_latitude"),
+  crs = 4326, remove = FALSE
+) %>% st_transform(tiles_crs)
+
+visit_with_tile <- st_join(
+  visit_sf, pop_tiles[, c("tile_id")],
+  join = st_within, left = TRUE
+)
+
+visit_info <- visit_with_tile %>%
+  st_drop_geometry() %>%
+  dplyr::mutate(d_tile_id = tile_id) %>%
+  dplyr::select(d_tile_id)
+
+stopifnot(nrow(visit_info) == nrow(ca_aug))
+ca_aug <- bind_cols(ca_aug, visit_info)
+
+## --- Summarize population-weighted activity per destination tile ---
+# Optional filter for only daytime:
+# ca_aug <- dplyr::filter(ca_aug, day_or_night == "daytime")
+
+### (A) Overall activity
+tile_activity_overall <- ca_aug %>%
+  dplyr::filter(!is.na(d_tile_id)) %>%
+  dplyr::mutate(weighted_activity = visit_fraction * origin_pop) %>%
+  dplyr::group_by(d_tile_id) %>%
+  dplyr::summarise(activity = sum(weighted_activity, na.rm = TRUE), .groups = "drop")
+
+### (B) Activity by date
+tile_activity_by_ds <- ca_aug %>%
+  dplyr::filter(!is.na(d_tile_id)) %>%
+  dplyr::mutate(weighted_activity = visit_fraction * origin_pop) %>%
+  dplyr::group_by(d_tile_id, ds) %>%
+  dplyr::summarise(activity = sum(weighted_activity, na.rm = TRUE), .groups = "drop")
+
+## --- Attach geometry (destination tiles) ---
+tile_activity_overall_sf <- pop_tiles %>%
+  dplyr::select(tile_id, geometry) %>%
+  dplyr::right_join(tile_activity_overall, by = c("tile_id" = "d_tile_id"))
+
+tile_activity_by_ds_sf <- pop_tiles %>%
+  dplyr::select(tile_id, geometry) %>%
+  dplyr::right_join(tile_activity_by_ds, by = c("tile_id" = "d_tile_id"))
+
+## --- Save outputs ---
+if (!dir.exists("data")) dir.create("data")
+
+st_write(tile_activity_overall_sf, "data/activity_by_pop_tiles_overall.gpkg", delete_dsn = TRUE)
+st_write(tile_activity_by_ds_sf, "data/activity_by_pop_tiles_by_ds.gpkg", delete_dsn = TRUE)
+
+# WGS84 for leaflet
+tile_activity_overall_ll <- st_transform(tile_activity_overall_sf, 4326)
+tile_activity_by_ds_ll <- st_transform(tile_activity_by_ds_sf, 4326)
+
+st_write(tile_activity_overall_ll, "data/activity_by_pop_tiles_overall_wgs84.geojson", delete_dsn = TRUE)
+st_write(tile_activity_by_ds_ll, "data/activity_by_pop_tiles_by_ds_wgs84.geojson", delete_dsn = TRUE)
+
+rm(tiles_crs, visit_info,visit_sf,visit_with_tile)
+
+```
+
+
+Plot it in Leaflet
+```{r}
+
+setwd("~/Costa-Rica-Mobility/Data")
+tile_activity_overall_ll <- st_read("activity_by_pop_tiles_overall_wgs84.geojson")  
+
+tile_activity_lonlat<-tile_activity_overall_ll%>%
+  mutate(activity_log=log(activity+1))
+
+# create color scale
+pal <- colorNumeric("YlOrRd", domain = tile_activity_lonlat$activity_log, na.color = "transparent")
+## create leaflet map
+leaflet(tile_activity_lonlat) %>% 
+  addTiles() %>% 
+  addPolygons(fillColor = ~pal(activity_log),
+              weight = 1, color = "black", fillOpacity = 0.7,
+              popup = ~paste0("Activity", round(activity, 3))) %>% 
+  addLegend(pal = pal, values = ~activity, title = "Activity Level", position = "bottomright")
+
+
+```
+
+
+Summarize and merge with Costa Rica districts polygon boundary
+```{r}
+#read in Costa Rica district data 
+setwd("~/Downloads/CR_district_population_GHSL_2025")
+districts <- st_read("CR_district_population_GHSL_2025.shp") %>%
+  st_make_valid()
+
+# Pick the column that identifies each district 
+name_col <- "NOMB_UGED"  
+
+# Make sure districts share CRS with tiles for mapping
+districts <- st_transform(districts, st_crs(tile_activity_lonlat))
+
+# --- 2) Compute totals per district using area-aware overlay ---
+# Work in a projected CRS for correct area math
+tiles_m   <- st_transform(tile_activity_overall_ll, 3857) %>%
+  mutate(
+    tile_area_m2     = as.numeric(st_area(geometry)),
+    activity_density = activity / tile_area_m2   # activity per m^2
+  )
+
+districts_m <- st_transform(districts, 3857) %>%
+  mutate(district_area_m2 = as.numeric(st_area(geometry)))
+
+# Intersect tiles and districts
+ix <- st_intersection(
+  tiles_m %>% select(activity_density),
+  districts_m %>% select(all_of(name_col), district_area_m2)
+) %>%
+  mutate(ix_area_m2 = as.numeric(st_area(geometry)))
+
+# Summarize per district
+district_activity <- ix %>%
+  st_drop_geometry() %>%
+  group_by(.data[[name_col]]) %>%
+  summarise(
+    total_activity           = sum(activity_density * ix_area_m2, na.rm = TRUE),        # ∑ density × area
+    mean_activity_density_aw = total_activity / first(district_area_m2),                # area-weighted mean
+    max_tile_density         = max(activity_density, na.rm = TRUE),                     # optional: max density tile overlapping district
+    sd_tile_density          = sd(activity_density,  na.rm = TRUE),                     # optional: sd of tile densities
+    .groups = "drop"
+  )
+
+# --- 3) Join back to polygons for mapping/exports ---
+districts_with_activity <- districts %>%
+  left_join(district_activity, by = setNames(name_col, name_col))
+
+# Example: map with leaflet (uses lon/lat CRS)
+pal <- colorNumeric("YlOrRd", domain = log(districts_with_activity$total_activity+1))
+ leaflet(districts_with_activity) %>%
+   addTiles() %>%
+   addPolygons(fillColor = ~pal(log(total_activity+1)), color = "#333", weight = 0.5,
+               fillOpacity = 0.7
+               ) 
+ 
+# Plot it
+ # log-transform then stretch domain
+vals <- log1p(districts_with_activity$total_activity)
+pal <- colorNumeric(
+  palette = "YlOrRd",
+  domain  = range(vals, na.rm = TRUE),
+  na.color = "transparent"
+)
+
+leaflet(districts_with_activity) %>%
+  addTiles() %>%
+  addPolygons(
+    fillColor   = ~pal(log1p(total_activity)),
+    color       = "#333",
+    weight      = 0.5,
+    fillOpacity = 0.8
+  ) %>%
+  addLegend(
+    pal     = pal,
+    values  = vals,
+    title   = "log(total activity + 1)",
+    position = "bottomright"
+  )
+
+
+## save output 
+if (!dir.exists("data")) dir.create("data")
+st_write(districts_with_activity, "data/Costa_Rica_districts_activity.gpkg", delete_dsn = TRUE)
+
+rm(district_activity,districts_m, home_info, home_sf, home_with_pop, ix, tiles_m)
+```
