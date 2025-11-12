@@ -12,12 +12,13 @@ library(data.table)
 
 # Set Mapdeck token
   mapdeck::set_token("pk.eyJ1IjoidHNocmFnYWkiLCJhIjoiY21oam84d2JtMWRnOTJpcTY0Mm9uamVmaCJ9.G1P5tS1f60KuJBKTkM-9lQ")
+  #mapdeck::set_token(Sys.getenv("MAPBOX_TOKEN"))
 
 # Read in necessary data
   setwd("~/Costa-Rica-Mobility/Data")
   pop_tiles <- st_read("costa_rica_activity_tiles_population.geojson")  
   #ca_aug <- read.csv("ca_aug.csv")
-  ca_aug <- fread("ca_aug.csv", nrows = 1000000)
+  ca_aug <- fread("ca_aug.csv", nrows = 10000)
   districts<- st_read("Costa_Rica_districts.gpkg")
 
 # 2) Config

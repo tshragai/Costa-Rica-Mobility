@@ -1,0 +1,751 @@
+---
+title: "Read and clean CR malaria data"
+output: html_document
+date: "2025-11-11"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Libraries 
+```{r set libraries}
+library(googledrive)
+library(googlesheets4)
+library(readxl)
+library(dplyr)
+library(stringi)
+library(purrr)
+library(tidyverse)
+library(tidygeocoder)
+library(sf)
+library(rnaturalearth)
+library(rmapshaper)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(sf)
+library(sf)
+library(dplyr)
+library(purrr)
+library(tidyr)
+library(osmdata)
+library(stringi)
+library(stringdist)
+library(readr)
+library(httr2)
+library(jsonlite)
+
+```
+
+Read in data from shared google drive
+```{r read in data}
+drive_auth()
+
+# Find and read the CSV (searching by partial name)
+url <- "https://drive.google.com/file/d/136w34SolnDfZntnfLpkKOwPfo3viu2fg/view?usp=drive_link"
+tmp <- drive_download(as_id(url), tempfile(fileext = ".csv"), overwrite = TRUE)
+mal15_19 <- read.csv(tmp$local_path)
+
+
+# Replace with your actual Google Drive file link
+url <- "https://docs.google.com/spreadsheets/d/1-YJsxhy_GqEOi9SvO667r3fg4fw4T7t8/edit?usp=drive_link&ouid=103128246894684431472&rtpof=true&sd=true"
+tmp <- drive_download(as_id(url), tempfile(fileext = ".xlsx"), overwrite = TRUE)
+mal23 <- read_xlsx(tmp$local_path)
+mal23<-filter(mal23, is.na(AÑO)==FALSE)
+
+rm(url, tmp)
+
+setwd("~/Downloads")
+write.csv(mal23,file="malaria_cr_2023.csv")
+```
+
+
+Validate districts in malaria data using Caroline's district data set 
+```{r read in data}
+#read in Costa Rica district data 
+setwd("~/Downloads/CR_district_population_GHSL_2025")
+districts <- st_read("CR_district_population_GHSL_2025.shp") %>%
+  st_make_valid()
+
+# ---- helpers ----
+norm_txt <- function(x) {
+  x |>
+    tolower() |>
+    stringi::stri_trans_general("Latin-ASCII") |>
+    trimws() |>
+    gsub("\\s+", " ", x = _)
+}
+make_key <- function(prov, dist) paste(norm_txt(prov), norm_txt(dist), sep = " | ")
+
+# ---- shapefile (districts) ----
+# NOMB_UGEC = Province, NOMB_UGEP = District
+districts_min <- districts %>%
+  transmute(
+    PROV_SHP = NOMB_UGEP,
+    DIST_SHP = NOMB_UGED,
+    geom = geometry
+  ) %>%
+  mutate(key = make_key(PROV_SHP, DIST_SHP))
+
+# ---- malaria data ----
+locs <- mal23 %>%
+  select(PROVINCIA, DISTRITO) %>%
+  distinct() %>%
+  mutate(key = make_key(PROVINCIA, DISTRITO))
+
+# ---- join ----
+locs_joined <- locs %>% left_join(st_drop_geometry(districts_min), by = "key")
+
+cat("Unique province-district combos:", nrow(locs_joined), "\n")
+cat("Matched to polygon   :", sum(!is.na(locs_joined$PROV_SHP)), "\n")
+cat("NOT matched          :", sum(is.na(locs_joined$PROV_SHP)), "\n")
+
+# list any unmatched combos
+unmatched <- locs_joined %>%
+  filter(is.na(PROV_SHP)) %>%
+  select(PROVINCIA, DISTRITO, key)
+if (nrow(unmatched)) {
+  write_csv(unmatched, "district_unmatched_prov_dist.csv")
+  message("⚠️ Wrote 'district_unmatched_prov_dist.csv' with unmatched province-district combos.")
+}
+
+# ---- attach polygons and centroids to full malaria dataset ----
+mal23 <- mal23 %>%
+  mutate(key = make_key(PROVINCIA, DISTRITO)) %>%
+  left_join(districts_min %>% st_drop_geometry(), by = "key")
+
+centroids <- st_point_on_surface(districts_min$geom)
+coords <- st_coordinates(centroids)
+lookup_centroids <- districts_min %>%
+  st_drop_geometry() %>%
+  transmute(key, dist_lat = coords[,2], dist_lon = coords[,1])
+
+mal23 <- mal23 %>% left_join(lookup_centroids, by = "key")
+
+
+rm(locs, locs_joined, unmatched, centroids, coords, lookup_centroids)
+
+```
+
+
+
+Now see if I can use locality column to find more specific locations
+```{r find locality}
+# ── Helpers ────────────────────────────────────────────────────
+norm_txt <- function(x) {
+  x |>
+    tolower() |>
+    stringi::stri_trans_general("Latin-ASCII") |>
+    trimws() |>
+    gsub("\\s+", " ", x = _)
+}
+
+# Remove generic locality words (helps fuzzy matching)
+strip_locality_terms <- function(x){
+  x <- norm_txt(x)
+  x <- gsub("\\b(barrio|bo\\.?|caserio|caserío|aldea|sector|vecindario|distrito|pueblo|centro)\\b", "", x)
+  x <- gsub("\\s+", " ", x)
+  trimws(x)
+}
+
+# pick best OSM candidate by (1) string similarity, (2) place rank
+place_priority <- function(p){
+  # higher is better
+  recode(p,
+         town = 6, village = 5, suburb = 4, neighbourhood = 3,
+         hamlet = 2, locality = 1, .default = 0)
+}
+
+# ── Build unique province–district list, attach polygons ───────
+prov_dist <- mal23 %>%
+  select(PROVINCIA, DISTRITO) %>%
+  distinct() %>%
+  mutate(key_pd = paste0(norm_txt(PROVINCIA), " | ", norm_txt(DISTRITO)))
+
+districts_pd <- districts_min %>%
+  mutate(key_pd = paste0(norm_txt(PROV_SHP), " | ", norm_txt(DIST_SHP))) %>%
+  group_by(key_pd) %>%
+  summarise(geom = st_union(geom), .groups = "drop")
+
+prov_dist <- prov_dist %>%
+  left_join(districts_pd, by = "key_pd") %>%
+  st_as_sf(sf_column_name = "geom")
+
+# ── Cache setup so we don’t re-query OSM ───────────────────────
+cache_file <- "osm_localities_by_district.rds"
+cache <- if (file.exists(cache_file)) readRDS(cache_file) else list()
+
+# ── Query OSM for “place” points inside each district polygon ──
+# place = locality/neighbourhood/suburb/hamlet/village/town
+fetch_osm_for_district <- function(poly) {
+  bb <- st_bbox(poly)
+  q <- opq(bbox = c(bb["xmin"], bb["ymin"], bb["xmax"], bb["ymax"])) %>%
+    add_osm_feature(key = "place",
+                    value = c("locality","neighbourhood","suburb","hamlet","village","town"))
+  res <- tryCatch(osmdata_sf(q), error = function(e) NULL)
+  if (is.null(res) || is.null(res$osm_points) || nrow(res$osm_points) == 0)
+    return(tibble(osm_name = character(), place = character(), lon = numeric(), lat = numeric()))
+  pts <- st_intersection(res$osm_points, poly) # keep only truly inside polygon
+  if (nrow(pts) == 0 || !"name" %in% names(pts)) {
+    return(tibble(osm_name = character(), place = character(), lon = numeric(), lat = numeric()))
+  }
+  coords <- st_coordinates(st_geometry(pts))
+  tibble(
+    osm_name = as.character(pts$name),
+    place    = as.character(pts$place),
+    lon      = coords[,1],
+    lat      = coords[,2]
+  ) %>%
+    filter(!is.na(osm_name)) %>%
+    distinct()
+}
+
+# make everything valid, WGS84, and drop rows with empty/NA geom
+prov_dist <- prov_dist |>
+  dplyr::mutate(geom = sf::st_make_valid(geom)) |>
+  sf::st_transform(4326)
+
+ok <- !sf::st_is_empty(prov_dist$geom) & !is.na(sf::st_is_empty(prov_dist$geom))
+prov_dist <- prov_dist[ok, , drop = FALSE]
+
+message("Fetching OSM localities per district (cached)...")
+osm_gazetteer <- map_dfr(seq_len(nrow(prov_dist)), function(i){
+  k <- prov_dist$key_pd[i]
+  if (!is.null(cache[[k]])) return(cache[[k]])
+  g <- fetch_osm_for_district(prov_dist$geom[i])
+  g$key_pd <- k
+  cache[[k]] <<- g
+  g
+})
+
+saveRDS(cache, cache_file)
+
+# ── Prepare gazetteer & your locality names for matching ───────
+gaz <- osm_gazetteer %>%
+  mutate(osm_name_norm = strip_locality_terms(osm_name),
+         place_rank = place_priority(place))
+
+locs <- mal23 %>%
+  select(PROVINCIA, DISTRITO, LOCALIDAD) %>%
+  mutate(
+    key_pd = paste0(norm_txt(PROVINCIA), " | ", norm_txt(DISTRITO)),
+    loc_norm = strip_locality_terms(LOCALIDAD)
+  ) %>%
+  distinct()
+
+# ── Fuzzy-match LOCALIDAD to OSM names inside the same district ─
+match_one <- function(row){
+  g <- gaz %>% filter(key_pd == row$key_pd)
+  if (nrow(g) == 0 || is.na(row$loc_norm) || row$loc_norm == "") {
+    return(tibble(best_name = NA_character_, place = NA_character_,
+                  lon = NA_real_, lat = NA_real_,
+                  dist = NA_real_, sim = NA_real_))
+  }
+  # string distance and similarity (OSA + Jaro-Winkler combo)
+  g$dist <- stringdist(row$loc_norm, g$osm_name_norm, method = "osa")
+  g$sim  <- stringsim(row$loc_norm, g$osm_name_norm, method = "jw")
+  # rank: lower dist first, then higher similarity, then better place type
+  g <- g %>% arrange(dist, desc(sim), desc(place_rank))
+  best <- g[1,]
+  tibble(best_name = best$osm_name,
+         place     = best$place,
+         lon       = best$lon,
+         lat       = best$lat,
+         dist      = best$dist,
+         sim       = best$sim)
+}
+
+matched <- locs %>%
+  rowwise() %>%
+  do(bind_cols(., match_one(.))) %>%
+  ungroup()
+
+# ── Accept only strong matches; else mark as unmatched ─────────
+# Tune thresholds: dist <= 2 OR (sim >= 0.90 and dist <= 4) usually works well
+matched <- matched %>%
+  mutate(
+    match_ok = (!is.na(lat)) & (dist <= 2 | (sim >= 0.90 & dist <= 4))
+  )
+
+# ── Build locality lookup table ─────────────────────────────────
+locality_lookup <- matched %>%
+  transmute(
+    PROVINCIA, DISTRITO, LOCALIDAD,
+    loc_match_name = best_name,
+    loc_place      = place,
+    lat_locality   = ifelse(match_ok, lat, NA_real_),
+    lon_locality   = ifelse(match_ok, lon, NA_real_),
+    match_dist     = dist,
+    match_sim      = sim,
+    match_ok
+  )
+
+# ---- make centroid lookup ----
+districts_pd <- districts_min %>%
+  mutate(key_pd = paste0(norm_txt(PROV_SHP), " | ", norm_txt(DIST_SHP))) %>%
+  group_by(key_pd) %>%
+  summarise(geom = st_union(geom), .groups = "drop")
+
+centroids <- st_point_on_surface(districts_pd$geom)
+coords <- st_coordinates(centroids)
+
+dist_centroid_tbl <- districts_pd %>%
+  st_drop_geometry() %>%
+  mutate(
+    dist_lat_centroid = coords[,2],
+    dist_lon_centroid = coords[,1]
+  ) %>%
+  select(key_pd, dist_lat_centroid, dist_lon_centroid)
+
+# ---- join locality + centroids to mal23 ----
+mal23_out <- mal23 %>%
+  mutate(key_pd = paste0(norm_txt(PROVINCIA), " | ", norm_txt(DISTRITO))) %>%
+  # ensure no previous centroid columns
+  select(-any_of(c("dist_lat","dist_lon",
+                   "dist_lat_centroid","dist_lon_centroid"))) %>%
+  # locality info
+  left_join(locality_lookup, by = c("PROVINCIA","DISTRITO","LOCALIDAD")) %>%
+  # centroids (renamed, so no suffixes)
+  left_join(dist_centroid_tbl, by = "key_pd") %>%
+  mutate(
+    lat_locality_final = coalesce(lat_locality, dist_lat_centroid),
+    lon_locality_final = coalesce(lon_locality, dist_lon_centroid),
+    locality_source = case_when(
+      !is.na(lat_locality) & !is.na(lon_locality) ~ "osm_locality",
+      TRUE ~ "district_centroid"
+    )
+  )
+
+# (Optional quick QA: how many matched?)
+table(mal23_out$locality_source)
+
+#clean up 
+rm(prov_dist, districts_pd, cache_file, cache, osm_gazetteer, gaz,
+   locs, matched, centroids, coords, dist_centroid_tbl,
+   fetch_osm_for_district, match_one,
+   strip_locality_terms, place_priority)
+```
+
+Extra search for places that are still missing localities
+```{r extra search for missing localities}
+
+# --- helpers ---
+norm <- function(x) {
+  x %>%
+    stri_trans_general("Latin-ASCII") %>%
+    toupper() %>%
+    gsub("[^A-Z0-9\\s]", " ", .) %>%
+    gsub("\\s+", " ", .) %>%
+    trimws()
+}
+
+# dictionary for frequent variants seen in failures
+canon_dict <- tribble(
+  ~from,                  ~to,
+  "LIMON DOS MIL",        "LIMON 2000",
+  "BAMBU DOS",            "BAMBU 2",
+  "JUAN PABLO SEGUNDO",   "JUAN PABLO II",
+  "COLINA SECTOR NUEVE",  "COLINA SECTOR 9",
+  "LOS GIRASOLES",        "LOS GIRASOLES",
+  "ATLANTIDA",            "ATLANTIDA",
+  "OJO DE AGUA",          "OJO DE AGUA",
+  "GUARARI",              "GUARARI",
+  "LA URUCA",             "LA URUCA",
+  "HATILLO OCHO",         "HATILLO 8",
+  "EL ROTULO",            "EL ROTULO",
+  "LOMAS DE RECOPE",      "LOMAS DE RECOPE",
+  "BOSQUE",               "BOSQUE",
+  "EL HUMO",              "EL HUMO",
+  "EL NUEVO CARIBE",      "NUEVO CARIBE",
+  "PASEO DE LAS FLORES",  "PASEO DE LAS FLORES",
+  "TICABAN",              "TICABAN",
+  "LAS BRISAS",           "LAS BRISAS",
+  "LA VIRGEN",            "LA VIRGEN",
+  "SAN PABLO",            "SAN PABLO",
+  "EL COROZO",            "EL COROZO",
+  "PRIMAVERA",            "PRIMAVERA"
+) %>% mutate(across(everything(), norm))
+
+canonize <- function(loc) {
+  n <- norm(loc)
+  hit <- canon_dict %>% filter(from == n)
+  if (nrow(hit)) hit$to[1] else n
+}
+
+# Build district polygons keyed by province|district (your validated layer)
+# districts must have columns: NOMB_UGEP (prov), NOMB_UGED (district), geometry
+districts_pd <- districts %>%
+  st_make_valid() %>%
+  transmute(
+    key_pd = paste(norm(NOMB_UGEP), norm(NOMB_UGED), sep=" | "),
+    geometry = geometry
+  ) %>%
+  group_by(key_pd) %>% summarise(geometry = st_union(geometry), .groups = "drop") %>%
+  st_transform(4326)
+
+# district centroids (fallback)
+cent_tbl <- districts_pd %>%
+  st_point_on_surface() %>%
+  mutate(dist_lat = st_coordinates(geometry)[,2],
+         dist_lon = st_coordinates(geometry)[,1]) %>%
+  st_drop_geometry()
+
+# --- take the failed rows from your data frame 'mal23' (replace this filter with your failed subset) ---
+failed <- filter(mal23_out, locality_source =="district_centroid") %>%
+  transmute(
+    PROV = norm(PROVINCIA),
+    CANT = norm(CANTÓN),
+    DIST = norm(DISTRITO),
+    LOC  = norm(LOCALIDAD),
+    Direccion = `DIRECCIÓN EXACTA`,
+    key_pd = paste(norm(PROVINCIA), norm(DISTRITO), sep=" | ")
+  ) %>%
+  distinct(PROV, CANT, DIST, LOC, key_pd, Direccion)%>%
+  filter(is.na(LOC)==FALSE, LOC!="DESCONOCIDO O NO COINCIDE")
+
+# restrict to rows that we have a district polygon for
+failed <- failed %>% semi_join(districts_pd, by="key_pd")
+
+# canonicalize locality
+failed <- failed %>%
+  mutate(LOC_CANON = vapply(LOC, canonize, character(1)))
+
+# --- Nominatim query inside district bbox ---
+nomi_query <- function(q, bbox) {
+  # bbox: xmin,ymin,xmax,ymax (WGS84)
+  url <- "https://nominatim.openstreetmap.org/search"
+  req <- request(url) |>
+    req_user_agent("epidemiology-geocoder/1.0 (contact: your_email@example.org)") |>
+    req_url_query(
+      q = q,
+      format = "jsonv2",
+      addressdetails = 0,
+      limit = 5,
+      viewbox = paste(bbox[c(1,3,2,4)], collapse=","),
+      bounded = 1
+    )
+  resp <- req_perform(req)
+  if (resp_status(resp) != 200) return(tibble())
+  out <- resp_body_json(resp, simplifyVector = TRUE)
+  if (length(out) == 0) return(tibble())
+  tibble(
+    display_name = out$display_name %||% NA_character_,
+    lat = as.numeric(out$lat),
+    lon = as.numeric(out$lon),
+    class = out$class %||% NA_character_,
+    type  = out$type  %||% NA_character_,
+    importance = out$importance %||% NA_real_
+  )
+}
+
+# 1) As a list-column of bbox vectors
+districts_pd <- districts_pd %>%
+  mutate(bbox = purrr::map(geometry, sf::st_bbox))
+
+# function to try several query patterns per locality
+make_queries <- function(prov, cant, dist, loc) {
+  # try most specific to less specific (w/ accents removed already)
+  c(
+    sprintf("%s, %s, %s, Costa Rica", loc, dist, prov),
+    sprintf("%s, %s, Costa Rica", loc, dist),
+    sprintf("%s, %s, %s", loc, cant, prov),
+    sprintf("%s, %s", loc, prov),
+    loc
+  )
+}
+
+# ---- Build per-district bbox as a list-column ----
+districts_pd <- districts_pd |>
+  dplyr::mutate(bbox = purrr::map(geometry, sf::st_bbox))
+
+# ---- Minimal Nominatim query helper (no extra packages required) ----
+nomi_query <- function(q, bb = NULL, limit = 5, lang = "es") {
+  base <- "https://nominatim.openstreetmap.org/search"
+  # viewbox = left,top,right,bottom (xmin, ymax, xmax, ymin)
+  vb <- ""
+  if (!is.null(bb)) {
+    left   <- bb[["xmin"]]; right <- bb[["xmax"]]
+    top    <- bb[["ymax"]]; bottom <- bb[["ymin"]]
+    if (all(is.finite(c(left, right, top, bottom)))) {
+      vb <- paste0("&viewbox=", left, ",", top, ",", right, ",", bottom, "&bounded=1")
+    }
+  }
+  url <- paste0(
+    base, "?format=jsonv2&limit=", limit,
+    "&accept-language=", utils::URLencode(lang),
+    "&q=", utils::URLencode(q),
+    vb
+  )
+  out <- tryCatch(jsonlite::fromJSON(url), error = function(e) NULL)
+  if (is.null(out) || NROW(out) == 0) {
+    return(tibble::tibble(
+      lat = numeric(0), lon = numeric(0),
+      class = character(0), type = character(0),
+      display_name = character(0), importance = numeric(0)
+    ))
+  }
+  tibble::tibble(
+    lat = as.numeric(out$lat),
+    lon = as.numeric(out$lon),
+    class = out$class,
+    type = out$type,
+    display_name = out$display_name,
+    importance = as.numeric(out$importance)
+  )
+}
+
+# ---- Geocode each failed locality with a cascade of queries ----
+lookup <- failed |>
+  dplyr::left_join(dplyr::select(districts_pd, key_pd, bbox), by = "key_pd") |>
+  dplyr::mutate(
+    qlist = purrr::pmap(
+      list(PROV, CANT, DIST, LOC_CANON),
+      ~ make_queries(..1, ..2, ..3, ..4)
+    ),
+    geocode = purrr::pmap(
+      list(qlist, bbox),
+      function(qs, bb) {
+        # try each query; keep the single best (by importance)
+        best <- NULL
+        for (q in qs) {
+          hit <- nomi_query(q, bb)
+          if (NROW(hit)) {
+            hit <- dplyr::arrange(hit, dplyr::desc(importance)) |>
+                   dplyr::slice(1)
+            best <- hit
+            break
+          }
+        }
+        if (is.null(best)) {
+          tibble::tibble(lat = NA_real_, lon = NA_real_,
+                         class = NA_character_, type = NA_character_,
+                         display_name = NA_character_, importance = NA_real_)
+        } else best
+      }
+    )
+  ) |>
+  tidyr::unnest_wider(geocode)
+
+# keep only key + polygon geometry from districts and drop sf class for the join
+districts_pd_slim <- districts_pd %>%
+  dplyr::select(key_pd, geometry) %>%
+  sf::st_as_sf() %>%
+  dplyr::mutate(geometry = sf::st_transform(geometry, 4326)) %>%
+  sf::st_drop_geometry()
+
+lookup<- lookup %>%
+  # join brings in only 'geom' (no geometry.x/y)
+  dplyr::inner_join(districts_pd_slim, by = "key_pd") %>%
+  # build a separate point sfc; keep polygons as the active geometry
+  dplyr::mutate(
+    pt = purrr::map2(
+      lon, lat,
+      ~ if (is.na(.x) || is.na(.y)) sf::st_point() else sf::st_point(c(.x, .y))
+    ),
+    pt = sf::st_sfc(pt, crs = 4326)
+  ) %>%
+  sf::st_as_sf(sf_column_name = "geometry")
+
+# row-aligned inside check (polygon vs point)
+inside_mat <- sf::st_covers(lookup$geometry, lookup$pt, sparse = FALSE)
+lookup$inside <- diag(inside_mat)
+
+#Check if points are more precise or district centroids 
+# 1) Classify each lookup row
+lookup <- lookup %>%
+  dplyr::mutate(
+    has_point = !is.na(lat) & !is.na(lon),
+    source_lookup = dplyr::case_when(
+      has_point & inside ~ "osm_locality",          # precise, inside the district
+      TRUE                 ~ "district_centroid"     # fallback (no point or outside)
+    )
+  )
+
+# quick counts
+table(lookup$source_lookup)
+
+lookup <- lookup%>%dplyr::filter(
+                        type == "neighbourhood" |
+                        type == "hamlet" |
+                        type == "administrative")%>%
+          filter(source_lookup!="district_centroid")%>%
+          filter(key_pd!="ALAJUELA | ALAJUELA")
+
+
+# ── 1) Normalize & pick one best row per locality from `lookup` ────────────────
+lookup_best <- lookup %>%
+  # harmonize names; prefer your canonical locality string if present
+  dplyr::transmute(
+    PROVINCIA = PROV,
+    DISTRITO  = DIST,
+    LOCALIDAD = dplyr::coalesce(LOC_CANON, LOC),
+    lat_precise = as.numeric(lat),
+    lon_precise = as.numeric(lon),
+    nominatim_type  = .data$type,
+    nominatim_class = .data$class,
+    importance = suppressWarnings(as.numeric(importance)),
+    inside = if ("inside" %in% names(.)) as.logical(.data$inside) else TRUE
+  ) %>%
+  # normalized join key to defeat accent/spacing mismatch
+  dplyr::mutate(
+    key_norm = paste(norm_txt(PROVINCIA), norm_txt(DISTRITO), norm_txt(LOCALIDAD), sep = "|"),
+    importance = dplyr::coalesce(importance, -Inf),
+    inside     = dplyr::coalesce(inside, FALSE)
+  ) %>%
+  # choose the single best candidate per normalized key
+  dplyr::arrange(key_norm, dplyr::desc(inside), dplyr::desc(importance)) %>%
+  dplyr::group_by(key_norm) %>%
+  dplyr::slice(1) %>%
+  dplyr::ungroup() %>%
+  dplyr::distinct(key_norm, .keep_all = TRUE)
+
+# ── 2) Upgrade mal23_out with precise coords when available ────────────────────
+mal23_merged <- mal23_out %>%
+  # keep original source so we can flag upgrades
+  dplyr::mutate(
+    prev_source = locality_source,
+    key_norm = paste(norm_txt(PROVINCIA), norm_txt(DISTRITO), norm_txt(LOCALIDAD), sep = "|")
+  ) %>%
+  dplyr::left_join(
+    lookup_best %>% dplyr::select(key_norm, lat_precise, lon_precise, nominatim_type, nominatim_class),
+    by = "key_norm"
+  ) %>%
+  dplyr::mutate(
+    lat_final = dplyr::coalesce(lat_precise, lat_locality_final),
+    lon_final = dplyr::coalesce(lon_precise, lon_locality_final),
+    locality_source = dplyr::case_when(
+      !is.na(lat_precise) & !is.na(lon_precise) ~ "lookup_precise",
+      TRUE                                     ~ prev_source
+    ),
+    upgraded_from_centroid = prev_source == "district_centroid" & locality_source == "lookup_precise"
+  ) %>%
+  dplyr::select(-key_norm, -prev_source, -lat_precise, -lon_precise)
+
+# ── 3) (Optional) Make an sf points layer from the chosen coords ───────────────
+mal23_pts <- tryCatch({
+  sf::st_as_sf(mal23_merged, coords = c("lon_final","lat_final"), crs = 4326, remove = FALSE)
+}, error = function(e) {
+  message("Skipping sf conversion (some rows missing coords): ", e$message)
+  mal23_merged
+})
+
+# ── 4) QA tallies ──────────────────────────────────────────────────────────────
+cat("Chosen source counts:\n")
+print(table(mal23_merged$locality_source, useNA = "ifany"))
+
+cat("\nUpgraded from district centroid -> precise:\n")
+print(sum(mal23_merged$upgraded_from_centroid, na.rm = TRUE))
+
+
+
+
+
+
+
+
+
+
+
+```
+
+
+```{r maps}
+# Ensure district polygons are valid & in WGS84
+dist_sf <- districts_min %>%
+  sf::st_as_sf() %>%
+  sf::st_make_valid() %>%
+  sf::st_transform(4326)
+
+# Choose the table with final coordinates. If you already built mal23_pts, use it;
+# otherwise, create it from mal23_merged (or mal23_out if you kept those names).
+if (exists("mal23_pts")) {
+  pts_df <- mal23_pts
+} else if (exists("mal23_merged")) {
+  pts_df <- mal23_merged
+} else {
+  pts_df <- mal23_out
+}
+
+# --- Parse your specific date column ---
+pts_df <- mal23_merged %>%
+  mutate(
+    case_date = as.Date(`FECHA INICIO SÍNTOMAS`),      # your date column
+    month = lubridate::floor_date(case_date, "month")
+  )
+
+# ── Define precision source (locality vs district centroid) ────────────────────
+# Map your existing labels to two buckets for color:
+#   - "locality" if you placed the point via locality/Nominatim/lookup
+#   - "district_centroid" if it fell back to the district centroid
+pts_df <- pts_df %>%
+  mutate(
+    precision_bucket = dplyr::case_when(
+      locality_source %in% c("lookup_precise", "osm_nominatim", "osm_locality", "lookup") ~ "locality",
+      locality_source %in% c("district_centroid") ~ "district_centroid",
+      TRUE ~ coalesce(locality_source, "district_centroid")
+    )
+  )
+
+# ── Aggregate to one bubble per location per month ─────────────────────────────
+# Uses your chosen final coordinates (lon_final/lat_final). If your columns are
+# named differently, change here.
+stopifnot(all(c("lon_final","lat_final") %in% names(pts_df)))
+
+by_month_pt <- pts_df %>%
+  filter(!is.na(lon_final), !is.na(lat_final), !is.na(month)) %>%
+  group_by(month, lon_final, lat_final, precision_bucket) %>%
+  summarise(n_cases = n(), .groups = "drop") %>%
+  sf::st_as_sf(coords = c("lon_final","lat_final"), crs = 4326, remove = FALSE)
+
+# color palette for precision type
+pal <- colorFactor(
+  palette = c("steelblue", "tomato","orange"),
+  domain  = unique(by_month_pt$precision_bucket)
+)
+
+# make sure districts are in WGS84
+districts_wgs <- st_transform(districts_min, 4326)
+
+# loop over months and draw one leaflet map per month
+for (mm in sort(unique(by_month_pt$month))) {
+  dat_m <- by_month_pt %>%
+    filter(month == mm)
+
+  m <- leaflet() %>%
+    addProviderTiles(providers$CartoDB.Positron) %>%
+    addPolygons(
+      data = districts_wgs,
+      fill = FALSE,
+      color = "#666666",
+      weight = 1,
+      opacity = 0.6
+    ) %>%
+    addCircleMarkers(
+      data = dat_m,
+      lng = ~lon_final,
+      lat = ~lat_final,
+      radius = ~pmax(3, sqrt(n_cases)),   # size by # cases
+      stroke = TRUE,
+      weight = 1,
+      opacity = 0.8,
+      fillOpacity = 0.7,
+      color = ~pal(precision_bucket),
+      label = ~paste0(
+        "Cases: ", n_cases, "<br>",
+        "Precision: ", precision_bucket
+      ),
+      labelOptions = labelOptions(direction = "auto")
+    ) %>%
+    addLegend(
+      "bottomright",
+      pal     = pal,
+      values  = dat_m$precision_bucket,
+      title   = "Geocode precision",
+      opacity = 0.8
+    ) 
+
+  print(m)  # show map for this month
+}
+
+```
+
