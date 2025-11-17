@@ -34,20 +34,21 @@ library(stringdist)
 library(readr)
 library(httr2)
 library(jsonlite)
-
+library(terra)
+library(elevatr)
 ```
 
 Read in data from shared google drive
 ```{r read in data}
 drive_auth()
 
-# Find and read the CSV (searching by partial name)
+# Read in 2015 to 2019 data
 url <- "https://drive.google.com/file/d/136w34SolnDfZntnfLpkKOwPfo3viu2fg/view?usp=drive_link"
 tmp <- drive_download(as_id(url), tempfile(fileext = ".csv"), overwrite = TRUE)
 mal15_19 <- read.csv(tmp$local_path)
 
 
-# Replace with your actual Google Drive file link
+# Read in 2023 data
 url <- "https://docs.google.com/spreadsheets/d/1-YJsxhy_GqEOi9SvO667r3fg4fw4T7t8/edit?usp=drive_link&ouid=103128246894684431472&rtpof=true&sd=true"
 tmp <- drive_download(as_id(url), tempfile(fileext = ".xlsx"), overwrite = TRUE)
 mal23 <- read_xlsx(tmp$local_path)
@@ -55,7 +56,7 @@ mal23<-filter(mal23, is.na(AÑO)==FALSE)
 
 rm(url, tmp)
 
-setwd("~/Downloads")
+setwd("~/Costa-Rica-Mobility/Data")
 write.csv(mal23,file="malaria_cr_2023.csv")
 ```
 
@@ -127,6 +128,255 @@ rm(locs, locs_joined, unmatched, centroids, coords, lookup_centroids)
 
 ```
 
+
+
+
+
+```{r find locality polygons}
+# ── Helpers ────────────────────────────────────────────────────
+norm_txt <- function(x) {
+  x |>
+    tolower() |>
+    stringi::stri_trans_general("Latin-ASCII") |>
+    trimws() |>
+    gsub("\\s+", " ", x = _)
+}
+
+# Remove generic locality words (helps fuzzy matching)
+strip_locality_terms <- function(x){
+  x <- norm_txt(x)
+  x <- gsub("\\b(barrio|bo\\.?|caserio|caserío|aldea|sector|vecindario|distrito|pueblo|centro)\\b", "", x)
+  x <- gsub("\\s+", " ", x)
+  trimws(x)
+}
+
+# rank OSM place types (higher = more preferred)
+place_priority <- function(p){
+  dplyr::recode(
+    p,
+    town         = 6,
+    village      = 5,
+    suburb       = 4,
+    neighbourhood= 3,
+    hamlet       = 2,
+    locality     = 1,
+    .default     = 0
+  )
+}
+
+# ── Build district polygons with keys ──────────────────────────
+districts_pd <- districts_min %>%
+  dplyr::mutate(
+    key_pd = paste0(norm_txt(PROV_SHP), " | ", norm_txt(DIST_SHP))
+  ) %>%
+  dplyr::group_by(key_pd) %>%
+  dplyr::summarise(geom_district = sf::st_union(geom), .groups = "drop") %>%
+  sf::st_make_valid() %>%
+  sf::st_transform(4326)
+
+# Unique province–district combos from mal23
+prov_dist <- mal23 %>%
+  dplyr::select(PROVINCIA, DISTRITO) %>%
+  dplyr::distinct() %>%
+  dplyr::mutate(
+    key_pd = paste0(norm_txt(PROVINCIA), " | ", norm_txt(DISTRITO))
+  ) %>%
+  dplyr::left_join(districts_pd, by = "key_pd") %>%
+  sf::st_as_sf(sf_column_name = "geom_district") %>%
+  dplyr::filter(!sf::st_is_empty(geom_district))
+
+# ── Cache setup so we don’t re-query OSM ───────────────────────
+cache_file <- "osm_locality_polygons_by_district.rds"
+cache <- if (file.exists(cache_file)) readRDS(cache_file) else list()
+
+# ── Query OSM for “place” polygons inside each district ────────
+# We use polygons + multipolygons with a place tag
+fetch_osm_for_district <- function(poly, key_pd) {
+  bb <- sf::st_bbox(poly)
+
+  q <- opq(bbox = c(bb["xmin"], bb["ymin"], bb["xmax"], bb["ymax"])) %>%
+    add_osm_feature(
+      key   = "place",
+      value = c("locality","neighbourhood","suburb","hamlet","village","town")
+    )
+
+  res <- tryCatch(osmdata_sf(q), error = function(e) NULL)
+  if (is.null(res)) {
+    return(tibble::tibble(
+      key_pd   = character(0),
+      osm_name = character(0),
+      place    = character(0),
+      geom     = sf::st_sfc(crs = 4326)
+    ))
+  }
+
+  polys <- list()
+  if (!is.null(res$osm_polygons) && nrow(res$osm_polygons) > 0) {
+    polys[[length(polys) + 1]] <- res$osm_polygons[, c("name", "place", "geometry")]
+  }
+  if (!is.null(res$osm_multipolygons) && nrow(res$osm_multipolygons) > 0) {
+    polys[[length(polys) + 1]] <- res$osm_multipolygons[, c("name", "place", "geometry")]
+  }
+
+  if (!length(polys)) {
+    return(tibble::tibble(
+      key_pd   = character(0),
+      osm_name = character(0),
+      place    = character(0),
+      geom     = sf::st_sfc(crs = 4326)
+    ))
+  }
+
+  polys <- do.call(rbind, polys) %>%
+    sf::st_make_valid() %>%
+    suppressMessages(sf::st_intersection(poly))
+
+  if (nrow(polys) == 0 || !"name" %in% names(polys)) {
+    return(tibble::tibble(
+      key_pd   = character(0),
+      osm_name = character(0),
+      place    = character(0),
+      geom     = sf::st_sfc(crs = 4326)
+    ))
+  }
+
+  tibble::tibble(
+    key_pd   = key_pd,
+    osm_name = as.character(polys$name),
+    place    = as.character(polys$place),
+    geom     = sf::st_geometry(polys)
+  ) %>%
+    dplyr::filter(!is.na(osm_name)) %>%
+    dplyr::distinct()
+}
+
+message("Fetching OSM locality polygons per district (cached)...")
+osm_gazetteer <- purrr::map_dfr(seq_len(nrow(prov_dist)), function(i) {
+  k <- prov_dist$key_pd[i]
+  if (!is.null(cache[[k]])) return(cache[[k]])
+  g <- fetch_osm_for_district(prov_dist$geom_district[i], k)
+  cache[[k]] <<- g
+  g
+})
+
+saveRDS(cache, cache_file)
+
+# ── Prepare gazetteer & your locality names for matching ───────
+gaz <- osm_gazetteer %>%
+  dplyr::mutate(
+    osm_name_norm = strip_locality_terms(osm_name),
+    place_rank    = place_priority(place)
+  )
+
+locs <- mal23 %>%
+  dplyr::select(PROVINCIA, DISTRITO, LOCALIDAD) %>%
+  dplyr::mutate(
+    key_pd   = paste0(norm_txt(PROVINCIA), " | ", norm_txt(DISTRITO)),
+    loc_norm = strip_locality_terms(LOCALIDAD)
+  ) %>%
+  dplyr::distinct()
+
+# ── Fuzzy-match LOCALIDAD to OSM polygon names in same district ─
+match_one <- function(loc_norm, key_pd) {
+  g <- dplyr::filter(gaz, key_pd == !!key_pd)
+
+  # no candidates or empty locality
+  if (nrow(g) == 0 || is.na(loc_norm) || loc_norm == "") {
+    return(tibble::tibble(
+      best_name     = NA_character_,
+      place         = NA_character_,
+      geom_locality = list(sf::st_geometrycollection()),
+      dist          = NA_real_,
+      sim           = NA_real_
+    ))
+  }
+
+  g$dist <- stringdist::stringdist(loc_norm, g$osm_name_norm, method = "osa")
+  g$sim  <- stringdist::stringsim(loc_norm, g$osm_name_norm, method = "jw")
+
+  g <- g %>%
+    dplyr::arrange(dist, dplyr::desc(sim), dplyr::desc(place_rank))
+
+  best <- g[1, ]
+
+  tibble::tibble(
+    best_name     = best$osm_name,
+    place         = best$place,
+    # single geometry stored as a list element (list-column)
+    geom_locality = list(best$geom[[1]]),
+    dist          = best$dist,
+    sim           = best$sim
+  )
+}
+
+# apply matcher rowwise, then expand by binding columns
+matched <- locs %>%
+  dplyr::rowwise() %>%
+  dplyr::do(dplyr::bind_cols(
+    .,
+    match_one(.$loc_norm, .$key_pd)
+  )) %>%
+  dplyr::ungroup()
+
+# turn list-column of geometries into an sfc
+matched <- matched %>%
+  dplyr::mutate(
+    geom_locality = sf::st_sfc(geom_locality, crs = 4326)
+  )
+
+# Accept only strong matches; else treat as unmatched
+matched <- matched %>%
+  dplyr::mutate(
+    match_ok = !sf::st_is_empty(geom_locality) &
+               (dist <= 2 | (sim >= 0.90 & dist <= 4))
+  )
+
+# ── Build locality lookup table (polygon geometries) ───────────
+locality_lookup <- matched %>%
+  dplyr::transmute(
+    PROVINCIA, DISTRITO, LOCALIDAD,
+    loc_match_name = best_name,
+    loc_place      = place,
+    geom_locality  = dplyr::if_else(
+      match_ok,
+      geom_locality,
+      sf::st_sfc(sf::st_geometrycollection(), crs = 4326)
+    )
+  )
+
+
+# ── Attach locality polygons / district polygons to mal23 ──────
+mal23_poly <- mal23 %>%
+  dplyr::mutate(
+    key_pd = paste0(norm_txt(PROVINCIA), " | ", norm_txt(DISTRITO))
+  ) %>%
+  dplyr::left_join(locality_lookup,
+                   by = c("PROVINCIA","DISTRITO","LOCALIDAD")) %>%
+  dplyr::left_join(districts_pd, by = "key_pd")   # adds geom_district
+
+# choose final polygon: locality polygon when available, else district polygon
+geom_final <- mal23_poly$geom_district
+has_loc_poly <- !sf::st_is_empty(mal23_poly$geom_locality)
+
+geom_final[has_loc_poly] <- mal23_poly$geom_locality[has_loc_poly]
+
+mal23_poly$geom_final <- geom_final
+
+mal23_poly <- sf::st_as_sf(
+  mal23_poly,
+  sf_column_name = "geom_final",
+  crs = 4326
+) %>%
+  dplyr::mutate(
+    locality_source = dplyr::case_when(
+      has_loc_poly ~ "osm_locality_polygon",
+      TRUE         ~ "district_polygon"
+    )
+  )
+
+# Quick QA
+table(mal23_poly$locality_source)
+```
 
 
 Now see if I can use locality column to find more specific locations
@@ -325,6 +575,8 @@ rm(prov_dist, districts_pd, cache_file, cache, osm_gazetteer, gaz,
    fetch_osm_for_district, match_one,
    strip_locality_terms, place_priority)
 ```
+
+
 
 Extra search for places that are still missing localities
 ```{r extra search for missing localities}
@@ -636,19 +888,28 @@ print(table(mal23_merged$locality_source, useNA = "ifany"))
 cat("\nUpgraded from district centroid -> precise:\n")
 print(sum(mal23_merged$upgraded_from_centroid, na.rm = TRUE))
 
+rm(
+  districts_pd,
+  cent_tbl,
+  districts_pd_slim,
+  inside_mat,
+  lookup_best,
+  canon_dict,
+  dat_m,
+  locality_lookup,
+  failed
+)
 
 
-
-
-
-
-
-
-
-
+#Save output to data folder
+setwd("~/Costa-Rica-Mobility/Data")
+saveRDS(mal23_merged, "~/Costa-Rica-Mobility/Data/mal23_merged.rds")
 ```
 
 
+
+
+Make maps
 ```{r maps}
 # Ensure district polygons are valid & in WGS84
 dist_sf <- districts_min %>%
@@ -749,3 +1010,790 @@ for (mm in sort(unique(by_month_pt$month))) {
 
 ```
 
+
+
+```{r malaria and mobility}
+
+#read in mobility tiles 
+setwd("~/Costa-Rica-Mobility/Data")
+mob<-st_read("activity_by_pop_tiles_overall_wgs84.geojson")%>%
+  st_make_valid()
+# make sure districts are in WGS84
+mob <- st_transform(mob, 4326)
+
+# Read in necessary data
+  setwd("~/Costa-Rica-Mobility/Data")
+  ca_aug <- fread("ca_aug.csv")
+
+#--------------------------------------------------
+# 0. Prep: cases as sf points, tiles in WGS84
+#--------------------------------------------------
+mal23_pts <- mal23_merged %>%
+  filter(!is.na(lon_final), !is.na(lat_final)) %>%
+  mutate(case_id = row_number()) %>%
+  st_as_sf(coords = c("lon_final", "lat_final"),
+           crs = 4326,
+           remove = FALSE)
+
+#--------------------------------------------------
+# 1. Tiles that contain a malaria case + immediate neighbours
+#--------------------------------------------------
+
+# which tile is each case in?
+case_tiles <- st_join(
+  mal23_pts %>% select(case_id),
+  mob %>% select(tile_id),
+  join = st_within,
+  left  = FALSE          # drop cases that don't fall in any tile
+)
+
+case_tile_ids <- unique(case_tiles$tile_id)
+
+# tiles that touch those case tiles (one-step neighbourhood)
+case_tiles_sf <- mob %>% filter(tile_id %in% case_tile_ids)
+touch_list    <- st_touches(case_tiles_sf, mob)
+
+neighbor_ids <- unique(unlist(
+  map(touch_list, ~ mob$tile_id[.x])
+))
+
+tiles_interest <- sort(unique(c(case_tile_ids, neighbor_ids)))
+
+# region of interest = union of those tiles
+roi_tiles  <- mob %>% filter(tile_id %in% tiles_interest)
+roi_union  <- st_union(roi_tiles)   # single polygon (or multipolygon)
+
+#--------------------------------------------------
+# 2. Filter ca_aug to trips where home OR visit is in ROI
+#--------------------------------------------------
+
+# add a row id so we can track rows through joins
+ca_aug <- ca_aug %>% mutate(row_id = row_number())
+
+# home locations as sf points
+home_sf <- st_as_sf(
+  ca_aug,
+  coords = c("home_longitude", "home_latitude"),
+  crs    = 4326,
+  remove = FALSE
+)
+
+# visit locations as sf points
+visit_sf <- st_as_sf(
+  ca_aug,
+  coords = c("visit_longitude", "visit_latitude"),
+  crs    = 4326,
+  remove = FALSE
+)
+
+# logical vectors: does point fall inside ANY ROI tile?
+idx_home  <- lengths(st_within(home_sf, roi_tiles))  > 0
+idx_visit <- lengths(st_within(visit_sf, roi_tiles)) > 0
+
+ca_aug_focus <- ca_aug[idx_home | idx_visit, ]
+
+#--------------------------------------------------
+# 3. (Optional) give the filtered trips tile_ids for home & visit
+#--------------------------------------------------
+
+# home tile_id
+home_focus_sf <- st_as_sf(
+  ca_aug_focus,
+  coords = c("home_longitude", "home_latitude"),
+  crs    = 4326,
+  remove = FALSE
+)
+
+home_tiles <- st_join(
+  home_focus_sf %>% select(row_id),
+  mob %>% select(tile_id),
+  join = st_within
+) %>%
+  st_drop_geometry() %>%
+  rename(home_tile_id = tile_id)
+
+# visit tile_id
+visit_focus_sf <- st_as_sf(
+  ca_aug_focus,
+  coords = c("visit_longitude", "visit_latitude"),
+  crs    = 4326,
+  remove = FALSE
+)
+
+visit_tiles <- st_join(
+  visit_focus_sf %>% select(row_id),
+  mob %>% select(tile_id),
+  join = st_within
+) %>%
+  st_drop_geometry() %>%
+  rename(visit_tile_id = tile_id)
+
+# attach tile ids
+ca_aug_focus <- ca_aug_focus %>%
+  left_join(home_tiles,  by = "row_id") %>%
+  left_join(visit_tiles, by = "row_id")
+
+#--------------------------------------------------
+# 4. Tiny helper object: tile for each case
+#    (useful later when you want per-case flows)
+#--------------------------------------------------
+
+case_tile_lookup <- case_tiles %>%
+  st_drop_geometry() %>%
+  distinct(case_id, tile_id)
+
+# Example: all trips that start or end in the *case tile*
+# (ignoring neighbours for the moment)
+flows_from_case_tiles <- ca_aug_focus %>%
+  semi_join(case_tile_lookup,
+            by = c("home_tile_id"  = "tile_id")) %>%
+  bind_rows(
+    ca_aug_focus %>%
+      semi_join(case_tile_lookup,
+                by = c("visit_tile_id" = "tile_id"))
+  ) %>%
+  distinct()
+
+```
+
+```{r prep to visualize}
+#--------------------------------------------------
+# 1. Case locations → tile_id + per-case ROI tiles
+#--------------------------------------------------
+
+# Case points with IDs (if you already have mal23_pts with case_id, skip this)
+mal23_pts <- mal23_merged %>%
+  filter(!is.na(lon_final), !is.na(lat_final)) %>%
+  mutate(case_id = row_number()) %>%
+  st_as_sf(coords = c("lon_final", "lat_final"),
+           crs = 4326,
+           remove = FALSE)
+
+# Which tile does each case fall in?
+case_tiles <- st_join(
+  mal23_pts %>% select(case_id),
+  mob %>% select(tile_id),
+  join = st_within,
+  left  = FALSE
+)
+
+case_tile_lookup <- case_tiles %>%
+  st_drop_geometry() %>%
+  distinct(case_id, tile_id)
+
+# Polygons for the *unique* case tiles
+case_tiles_polys <- mob %>%
+  filter(tile_id %in% unique(case_tile_lookup$tile_id))
+
+# For each case tile, which tiles touch it?
+touch_list <- st_touches(case_tiles_polys, mob)
+
+# Long table: center tile + all neighbours (this is the ROI per tile)
+adj_long <- map2_dfr(
+  case_tiles_polys$tile_id,
+  seq_along(case_tiles_polys$tile_id),
+  ~ tibble(
+      tile_id_center = .x,
+      roi_tile_id    = c(.x, mob$tile_id[touch_list[[.y]]])  # include center
+    )
+) %>%
+  distinct()
+
+# Map each *case* to its ROI tiles
+case_roi <- case_tile_lookup %>%
+  left_join(adj_long, by = c("tile_id" = "tile_id_center"))
+# columns: case_id (malaria case), tile_id (case tile), roi_tile_id (case's tiles of interest)
+
+#--------------------------------------------------
+# 2. Build long "per-case, per-trip" view of flows
+#    (one row per case × trip × endpoint in ROI)
+#--------------------------------------------------
+
+# Adjust column names here to match your ca_aug_focus
+flows_long <- ca_aug_focus %>%
+  select(
+    row_id,
+    visit_fraction,
+    home_tile_id,
+    visit_tile_id
+  ) %>%
+  # Trips where HOME tile is in a case's ROI
+  left_join(case_roi, by = c("home_tile_id" = "roi_tile_id")) %>%
+  mutate(endpoint_role = "home") %>%
+
+  bind_rows(
+    # Trips where VISIT tile is in a case's ROI
+    ca_aug_focus %>%
+      select(
+        row_id,
+        visit_fraction,
+        home_tile_id,
+        visit_tile_id
+      ) %>%
+      left_join(case_roi, by = c("visit_tile_id" = "roi_tile_id")) %>%
+      mutate(endpoint_role = "visit")
+  ) %>%
+  filter(!is.na(case_id)) %>%          # keep only trips linked to some case
+  distinct(case_id, endpoint_role, row_id, .keep_all = TRUE)
+
+# flows_long columns:
+#   case_id         – malaria case
+#   endpoint_role   – "home" or "visit" (which side is inside the ROI)
+#   row_id          – original row in ca_aug
+#   home_tile_id    – origin tile
+#   visit_tile_id   – destination tile
+#   visit_fraction, date, day_night, etc.
+
+#--------------------------------------------------
+# 3. Aggregated per-case OD flow table (for plotting)
+#--------------------------------------------------
+
+case_flow_summary <- flows_long %>%
+  group_by(case_id, endpoint_role, home_tile_id, visit_tile_id) %>%
+  summarise(
+    n_trips          = n(),
+    total_visit_frac = sum(visit_fraction, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# `case_flow_summary` is your tidy "per-case flow" table:
+#   - one row per case × (home_tile_id, visit_tile_id) × endpoint_role
+#   - n_trips / total_visit_frac describe flow strength
+
+```
+
+
+```{r visualize}
+
+# Case points with IDs (if you already have mal23_pts with case_id, skip this)
+mal23_pts <- mal23_merged %>%
+  filter(!is.na(lon_final), !is.na(lat_final)) %>%
+  mutate(case_id = row_number()) %>%
+  st_as_sf(coords = c("lon_final", "lat_final"),
+           crs = 4326,
+           remove = FALSE)
+#--------------------------------------------------
+# 0. Filter cases: precise locality + not San José
+#--------------------------------------------------
+cases_keep <- mal23_pts %>%
+  filter(
+    locality_source != "district_centroid",  # use only precise localities
+    PROVINCIA != "SAN JOSE"                  # adjust spelling if needed
+  ) %>%
+  st_transform(4326)
+
+mob <- st_transform(mob, 4326)
+
+#--------------------------------------------------
+# 1. Get elevation and compute min elevation per tile
+#--------------------------------------------------
+
+# union of all tiles for bounding extent
+tiles_union <- st_union(mob)
+
+# download DEM (SRTM / NASADEM via elevatr)
+dem_r <- get_elev_raster(
+  locations = mob,              # sf polygons
+  z = 11,
+  prj = st_crs(mob)$wkt,
+  clip = "bbox"                 # clip to bbox of mob
+)
+dem <- rast(dem_r)  # -> terra raster
+
+# compute minimum elevation per tile polygon
+mob_terra <- vect(mob)
+
+tile_elev <- terra::extract(
+  dem,
+  mob_terra,
+  fun   = min,     # minimum elevation
+  na.rm = TRUE,
+  ID    = FALSE
+)
+
+# attach elevation back to mob (meters + feet)
+mob$elev_min_m  <- tile_elev[, 1]
+mob$elev_min_ft <- mob$elev_min_m * 3.28084
+
+#--------------------------------------------------
+# 2. Snap each case point to a mobility tile
+#--------------------------------------------------
+
+# keep only tile_id + geometry
+mob_tiles <- mob %>%
+  select(tile_id, geometry)
+
+# which tile does each case fall in?
+cases_tiles <- st_join(
+  cases_keep %>% select(case_id),  # geometry + case_id
+  mob_tiles,
+  join = st_intersects,
+  left  = FALSE                    # drop cases not in any tile
+) %>%
+  st_drop_geometry() %>%
+  distinct(case_id, tile_id)
+
+# if a case touches multiple tiles, keep the first
+cases_tiles <- cases_tiles %>%
+  group_by(case_id) %>%
+  slice(1) %>%
+  ungroup()
+
+# attach tile_id back to case points for plotting
+cases_keep <- cases_keep %>%
+  left_join(cases_tiles, by = "case_id")
+
+#--------------------------------------------------
+# 3. Tile centroid + elevation lookup for endpoints
+#--------------------------------------------------
+tile_centers <- mob %>%
+  mutate(cent = st_centroid(geometry)) %>%
+  mutate(
+    lon = st_coordinates(cent)[, 1],
+    lat = st_coordinates(cent)[, 2]
+  ) %>%
+  st_drop_geometry() %>%
+  select(tile_id, lon, lat, elev_min_ft)
+
+#--------------------------------------------------
+# 4. Build outgoing & incoming flows per case
+#--------------------------------------------------
+# OUTGOING: case tile is origin
+flows_out_raw <- cases_tiles %>%
+  inner_join(
+    ca_aug,
+    by = c("tile_id" = "o_tile_id")  # case tile matches origin tile
+  ) %>%
+  rename(
+    tile_o = tile_id,    # origin tile (case)
+    tile_d = d_tile_id   # destination tile
+  )
+
+# INCOMING: case tile is destination
+flows_in_raw <- cases_tiles %>%
+  inner_join(
+    ca_aug,
+    by = c("tile_id" = "d_tile_id")  # case tile matches destination tile
+  ) %>%
+  rename(
+    tile_d = tile_id,    # destination tile (case)
+    tile_o = o_tile_id   # origin tile
+  )
+
+#--------------------------------------------------
+# 5. Attach centroids & elevation; build LINESTRINGs
+#--------------------------------------------------
+make_flow_lines <- function(flows_df) {
+  flows_df %>%
+    # origin coords + elevation
+    left_join(
+      tile_centers %>%
+        rename(
+          lon_o      = lon,
+          lat_o      = lat,
+          elev_o_ft  = elev_min_ft
+        ),
+      by = c("tile_o" = "tile_id")
+    ) %>%
+    # destination coords + elevation
+    left_join(
+      tile_centers %>%
+        rename(
+          lon_d      = lon,
+          lat_d      = lat,
+          elev_d_ft  = elev_min_ft
+        ),
+      by = c("tile_d" = "tile_id")
+    ) %>%
+    # drop rows missing coords
+    filter(
+      !is.na(lon_o), !is.na(lat_o),
+      !is.na(lon_d), !is.na(lat_d)
+    ) %>%
+    # build sf LINESTRING geometry
+    mutate(
+      geometry = purrr::pmap(
+        list(lon_o, lat_o, lon_d, lat_d),
+        ~ st_linestring(matrix(c(..1, ..3, ..2, ..4), ncol = 2, byrow = FALSE))
+      )
+    ) %>%
+    st_as_sf(crs = 4326)
+}
+
+flows_out_sf <- make_flow_lines(flows_out_raw) %>%
+  mutate(direction = "Outgoing")
+
+flows_in_sf <- make_flow_lines(flows_in_raw) %>%
+  mutate(direction = "Incoming")
+
+flows_all <- bind_rows(flows_out_sf, flows_in_sf)
+
+#--------------------------------------------------
+# 6. Optional elevation filters
+#--------------------------------------------------
+# Keep ONLY flows where either end is above 1000 ft:
+flows_high <- flows_all %>%
+  filter(elev_o_ft > 1000 | elev_d_ft > 1000)
+
+# Keep ONLY flows where both ends are ≤ 1000 ft (lowland flows):
+flows_low <- flows_all %>%
+  filter(elev_o_ft <= 1000 & elev_d_ft <= 1000)
+
+# Choose which to plot:
+flows_to_plot <- flows_low   # all flows
+# flows_to_plot <- flows_high # only high-elevation-related flows
+# flows_to_plot <- flows_low  # only lowland flows
+
+#--------------------------------------------------
+# 7. Base layer with districts (optional)
+#--------------------------------------------------
+districts_base <- districts_min %>% st_transform(4326)
+
+#--------------------------------------------------
+# 8. Plot: two panels (Outgoing vs Incoming)
+#--------------------------------------------------
+gg_flows <- ggplot() +
+  geom_sf(
+    data  = districts_base,
+    fill  = NA,
+    color = "grey85",
+    linewidth = 0.2
+  ) +
+  geom_sf(
+    data = filter(flows_to_plot, case_id==1),
+    aes(size =2, color = direction),
+    alpha = 0.5
+  ) +
+  geom_sf(
+    data  = cases_keep,
+    color = "black",
+    fill  = "yellow",
+    shape = 21,
+    stroke = 0.3,
+    size   = 1.5
+  ) +
+  scale_size_continuous(name = "Trips", range = c(0.2, 2.5)) +
+  scale_color_manual(values = c("Outgoing" = "red", "Incoming" = "blue")) +
+  facet_wrap(~ direction) +
+  coord_sf() +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    strip.text      = element_text(face = "bold")
+  ) +
+  labs(
+    title    = "Mobility flows to and from malaria case tiles",
+    subtitle = "Lines sized by n_trips; cases as yellow points\nElevation from SRTM-derived DEM",
+    x = NULL, y = NULL
+  )
+
+gg_flows
+
+
+
+```
+
+
+
+```{r plotly plot}
+
+
+#--------------------------------------------------
+# 0. Elevation filter: keep flows where BOTH tiles < 1000 m
+#--------------------------------------------------
+
+# if you’d rather work in meters:
+flows_all_filt <- flows_all %>%
+  mutate(
+    elev_o_m = elev_o_ft * 0.3048,
+    elev_d_m = elev_d_ft * 0.3048
+  ) %>%
+  filter(elev_o_m < 1000, elev_d_m < 1000)%>%
+  st_transform(4326)
+
+flows_all_filt <- flows_all_filt %>%
+  mutate(
+    elev_o = elev_o_ft,
+    elev_d = elev_d_ft
+  ) %>%
+  filter(elev_o < 1000, elev_d < 1000)
+
+
+# split by direction for convenience
+flows_in_all  <- flows_all_filt %>% filter(direction == "Incoming")
+flows_out_all <- flows_all_filt %>% filter(direction == "Outgoing")
+
+#--------------------------------------------------
+# 1. Case metadata: dates + lon/lat
+#--------------------------------------------------
+
+cases_pts <- mal23_pts %>%
+  st_transform(4326) %>%
+  mutate(
+    lon = st_coordinates(geometry)[, 1],
+    lat = st_coordinates(geometry)[, 2],
+    onset_date  = as.Date(`FECHA INICIO SÍNTOMAS`),
+    onset_month = floor_date(onset_date, "month")
+  )
+
+cases_meta <- cases_pts %>%
+  st_drop_geometry() %>%                # drop geometry, keep lon/lat
+  filter(case_id %in% flows_all_filt$case_id)
+
+case_ids <- sort(unique(cases_meta$case_id))
+
+# helper
+month_floor <- function(x) floor_date(x, "month")
+
+#--------------------------------------------------
+# 2. Base plots: background all cases (grey)
+#--------------------------------------------------
+
+# we'll build two separate plotly objects
+p_in  <- plot_ly()
+p_out <- plot_ly()
+
+# --- Incoming panel base (all cases, faint) ---
+p_in <- p_in %>%
+  add_trace(
+    data = cases_meta,
+    type = "scatter",
+    mode = "markers",
+    x = ~lon, y = ~lat,
+    marker = list(size = 4, color = "grey80"),
+    name   = "All cases (background)",
+    hoverinfo = "text",
+    text = ~paste0("Case: ", case_id,
+                   "<br>Date: ", onset_date),
+    showlegend = TRUE
+  )
+
+# --- Outgoing panel base (all cases, faint) ---
+p_out <- p_out %>%
+  add_trace(
+    data = cases_meta,
+    type = "scatter",
+    mode = "markers",
+    x = ~lon, y = ~lat,
+    marker = list(size = 4, color = "grey80"),
+    name   = "All cases (background)",
+    hoverinfo = "text",
+    text = ~paste0("Case: ", case_id,
+                   "<br>Date: ", onset_date),
+    showlegend = TRUE
+  )
+
+# track trace counts and visibility vectors
+trace_idx_in  <- length(p_in$x$data)
+trace_idx_out <- length(p_out$x$data)
+base_traces_in  <- seq_len(trace_idx_in)
+base_traces_out <- seq_len(trace_idx_out)
+
+trace_vis_in  <- list()
+trace_vis_out <- list()
+
+#--------------------------------------------------
+# 3. Add per-case traces + visibility masks
+#--------------------------------------------------
+
+for (cid in case_ids) {
+
+  # metadata for this case
+  meta_i <- cases_meta %>% filter(case_id == cid)
+  this_month <- meta_i$onset_month[1]
+
+  incoming_months <- c(this_month - months(1), this_month)
+  outgoing_months <- c(this_month, this_month + months(1))
+
+  # flows for this case
+  flows_in_i  <- flows_in_all  %>% filter(case_id == cid)
+  flows_out_i <- flows_out_all %>% filter(case_id == cid)
+
+  # case points for panels
+  pts_incoming_panel <- cases_meta %>%
+    filter(month_floor(onset_date) %in% incoming_months)
+
+  pts_outgoing_panel <- cases_meta %>%
+    filter(month_floor(onset_date) %in% outgoing_months)
+
+  ## ---------------- Incoming panel traces ---------------- ##
+  vis_in <- rep(FALSE, trace_idx_in)  # existing traces so far
+
+  # 1) incoming lines for this case
+  if (nrow(flows_in_i) > 0) {
+    p_in <- p_in %>%
+      add_sf(
+        data  = flows_in_i,
+        inherit = FALSE,
+        color = I("blue"),
+        span = I(1.2),
+        name = paste("Incoming flows (case", cid, ")"),
+        hoverinfo = "text",
+        text = ~paste0(
+          "Case: ", case_id,
+          "<br>Origin tile: ", tile_o,
+          "<br>Dest tile: ", tile_d,
+          "<br>Elev O (m): ", round(elev_o, 1),
+          "<br>Elev D (m): ", round(elev_d, 1)
+        )
+      )
+    trace_idx_in <- trace_idx_in + 1
+    vis_in <- c(vis_in, TRUE)
+  }
+
+  # 2) points: prev + current month
+  if (nrow(pts_incoming_panel) > 0) {
+    p_in <- p_in %>%
+      add_trace(
+        data = pts_incoming_panel,
+        type = "scatter",
+        mode = "markers",
+        x = ~lon, y = ~lat,
+        marker = list(size = 7, color = "blue", symbol = "circle"),
+        name   = paste("Prev+current month (case", cid, ")"),
+        inherit = FALSE,
+        hoverinfo = "text",
+        text = ~paste0("Case: ", case_id,
+                       "<br>Date: ", onset_date)
+      )
+    trace_idx_in <- trace_idx_in + 1
+    vis_in <- c(vis_in, TRUE)
+  }
+
+  # base traces always visible
+  vis_in[base_traces_in] <- TRUE
+  trace_vis_in[[as.character(cid)]] <- vis_in
+
+  ## ---------------- Outgoing panel traces ---------------- ##
+  vis_out <- rep(FALSE, trace_idx_out)
+
+  # 1) outgoing lines for this case
+  if (nrow(flows_out_i) > 0) {
+    p_out <- p_out %>%
+      add_sf(
+        data  = flows_out_i,
+        inherit = FALSE,
+        color = I("red"),
+        span = I(1.2),
+        name = paste("Outgoing flows (case", cid, ")"),
+        hoverinfo = "text",
+        text = ~paste0(
+          "Case: ", case_id,
+          "<br>Origin tile: ", tile_o,
+          "<br>Dest tile: ", tile_d,
+          "<br>Elev O (m): ", round(elev_o, 1),
+          "<br>Elev D (m): ", round(elev_d, 1)
+        )
+      )
+    trace_idx_out <- trace_idx_out + 1
+    vis_out <- c(vis_out, TRUE)
+  }
+
+  # 2) points: current + next month
+  if (nrow(pts_outgoing_panel) > 0) {
+    p_out <- p_out %>%
+      add_trace(
+        data = pts_outgoing_panel,
+        type = "scatter",
+        mode = "markers",
+        x = ~lon, y = ~lat,
+        marker = list(size = 7, color = "red", symbol = "circle-open"),
+        name   = paste("Current+next month (case", cid, ")"),
+        inherit = FALSE,
+        hoverinfo = "text",
+        text = ~paste0("Case: ", case_id,
+                       "<br>Date: ", onset_date)
+      )
+    trace_idx_out <- trace_idx_out + 1
+    vis_out <- c(vis_out, TRUE)
+  }
+
+  vis_out[base_traces_out] <- TRUE
+  trace_vis_out[[as.character(cid)]] <- vis_out
+}
+
+# standardize visibility vector lengths
+n_traces_in  <- length(p_in$x$data)
+n_traces_out <- length(p_out$x$data)
+
+trace_vis_in <- lapply(trace_vis_in, function(v) {
+  if (length(v) < n_traces_in) c(v, rep(FALSE, n_traces_in - length(v))) else v[seq_len(n_traces_in)]
+})
+
+trace_vis_out <- lapply(trace_vis_out, function(v) {
+  if (length(v) < n_traces_out) c(v, rep(FALSE, n_traces_out - length(v))) else v[seq_len(n_traces_out)]
+})
+
+#--------------------------------------------------
+# 4. Dropdown menus
+#--------------------------------------------------
+
+buttons_in <- purrr::map(names(trace_vis_in), function(cid_chr) {
+  list(
+    method = "restyle",
+    args   = list("visible", trace_vis_in[[cid_chr]]),
+    label  = paste("Case", cid_chr)
+  )
+})
+
+buttons_out <- purrr::map(names(trace_vis_out), function(cid_chr) {
+  list(
+    method = "restyle",
+    args   = list("visible", trace_vis_out[[cid_chr]]),
+    label  = paste("Case", cid_chr)
+  )
+})
+
+p_in <- p_in %>%
+  layout(
+    title = "Incoming travel to case tiles (<1000 m at origin & destination)",
+    xaxis = list(title = "Longitude"),
+    yaxis = list(title = "Latitude", scaleanchor = "x", scaleratio = 1),
+    updatemenus = list(
+      list(
+        type = "dropdown",
+        active = 0,
+        x = 1.05, y = 1,
+        xanchor = "left",
+        buttons = buttons_in,
+        showactive = TRUE
+      )
+    ),
+    legend = list(orientation = "v")
+  )
+
+p_out <- p_out %>%
+  layout(
+    title = "Outgoing travel from case tiles (<1000 m at origin & destination)",
+    xaxis = list(title = "Longitude"),
+    yaxis = list(title = "Latitude", scaleanchor = "x", scaleratio = 1),
+    updatemenus = list(
+      list(
+        type = "dropdown",
+        active = 0,
+        x = 1.05, y = 1,
+        xanchor = "left",
+        buttons = buttons_out,
+        showactive = TRUE
+      )
+    ),
+    legend = list(orientation = "v")
+  )
+
+# Show panels (e.g. one above the other in the Rmd)
+p_in
+p_out
+```
+
+
+
+
+Next steps
+1. pull in elevation and filter cases and travel to/from elevation >1000 tiles
+2. calculate people weight per travel line using population data
+3. color travel line by number of people traveling 
+4. Case selector? can I do that statically in an RMD? Case click would be even better 
+5. Weekly plots? Monthly plots? 
+6. Start thinking about what the data frame looks like for a basic analysis
+
+Then what about a two panel in/out map with a dropdown selector per case, when you select the case it shows all the travel lines in and out for that case and also shows all the cases that happened the previous+current month (incoming map) and the following+current month (Outgoing map). It should filter travel >1000 m and weight by people traveling so hopefully that'll help visually. 

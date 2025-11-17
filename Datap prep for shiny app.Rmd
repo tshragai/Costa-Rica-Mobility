@@ -1,0 +1,292 @@
+---
+title: "Data prep for shiny app"
+output: html_document
+date: "2025-11-17"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#libraries
+library(dplyr)
+library(sf)
+library(lubridate)
+library(data.table)
+library(terra)
+library(elevatr)
+library(purrr)
+
+#project root and directory for data saves
+proj_root <- "~/Costa-Rica-Mobility"
+data_dir  <- file.path(proj_root, "Data")
+```
+
+
+```{r read in data I'll use}
+setwd("~/Costa-Rica-Mobility/Data")
+
+#malaria data with point locations
+mal23_merged <- readRDS(file.path(data_dir, "mal23_merged.rds"))
+
+#create points
+mal23_pts <- mal23_merged %>%
+  filter(!is.na(lon_final), !is.na(lat_final)) %>%
+  mutate(case_id = row_number()) %>%
+  st_as_sf(coords = c("lon_final", "lat_final"),
+           crs = 4326,
+           remove = FALSE)
+
+saveRDS(mal23_pts,     file.path(data_dir, "mal23_pts.rds"))
+
+################################################################################
+#activity tiles 
+mob <- st_read("activity_by_pop_tiles_overall_wgs84.geojson") %>%
+  st_make_valid() %>%
+  st_transform(4326)
+
+#elevation per mobility tile
+dem_r <- get_elev_raster(
+  locations = mob,
+  z   = 11,
+  prj = st_crs(mob)$wkt,
+  clip = "bbox"
+)
+
+dem       <- rast(dem_r)
+mob_terra <- vect(mob)
+
+tile_elev <- terra::extract(
+  dem,
+  mob_terra,
+  fun   = min,
+  na.rm = TRUE,
+  ID    = FALSE
+)
+
+mob$elev_min_m  <- tile_elev[, 1]
+mob$elev_min_ft <- mob$elev_min_m * 3.28084
+
+################################################################################
+#full mobility data
+setwd("~/Downloads")
+ca_aug <- fread(file.path(data_dir, "ca_aug.csv"))
+
+################################################################################
+#district polygons
+setwd("~/Downloads/CR_district_population_GHSL_2025")
+districts <- st_read("CR_district_population_GHSL_2025.shp") %>%
+  st_make_valid()
+
+# helpers 
+norm_txt <- function(x) {
+  x |>
+    tolower() |>
+    stringi::stri_trans_general("Latin-ASCII") |>
+    trimws() |>
+    gsub("\\s+", " ", x = _)
+}
+make_key <- function(prov, dist) paste(norm_txt(prov), norm_txt(dist), sep = " | ")
+
+# NOMB_UGEP = Province, NOMB_UGED = District
+districts_min <- districts %>%
+  transmute(
+    PROV_SHP = NOMB_UGEP,
+    DIST_SHP = NOMB_UGED,
+    geom     = geometry
+  ) %>%
+  mutate(key = make_key(PROV_SHP, DIST_SHP))
+
+#save for reuse in Shiny
+saveRDS(districts_min, file.path(data_dir, "districts_min.rds"))
+
+```
+
+```{r more data prep}
+# --------------------------------------------------------------------
+#Assign each case to a mobility tile
+# --------------------------------------------------------------------
+mob_tiles <- mob %>% select(tile_id, geometry)
+
+cases_tiles <- st_join(
+  mal23_pts %>% select(case_id),
+  mob_tiles,
+  join = st_within,
+  left  = FALSE               # drop cases not in any tile
+) %>%
+  st_drop_geometry() %>%
+  distinct(case_id, tile_id) %>%
+  group_by(case_id) %>%
+  slice(1) %>%
+  ungroup()
+
+# (Optional) attach tile_id back to case points
+mal23_pts <- mal23_pts %>%
+  left_join(cases_tiles, by = "case_id")
+
+# --------------------------------------------------------------------
+#Tile centroids + elevation lookup
+# --------------------------------------------------------------------
+tile_centers <- mob %>%
+  mutate(cent = st_centroid(geometry)) %>%
+  mutate(
+    lon = st_coordinates(cent)[, 1],
+    lat = st_coordinates(cent)[, 2]
+  ) %>%
+  st_drop_geometry() %>%
+  select(tile_id, lon, lat, elev_min_ft)
+
+# --------------------------------------------------------------------
+#Build flow lines (Outgoing & Incoming) with elevation
+# --------------------------------------------------------------------
+# OUTGOING: case tile is origin
+flows_out_raw <- cases_tiles %>%
+  inner_join(
+    ca_aug,
+    by = c("tile_id" = "o_tile_id")   # case tile matches origin tile
+  ) %>%
+  rename(
+    tile_o = tile_id,    # origin tile (case)
+    tile_d = d_tile_id   # destination tile
+  )
+
+# INCOMING: case tile is destination
+flows_in_raw <- cases_tiles %>%
+  inner_join(
+    ca_aug,
+    by = c("tile_id" = "d_tile_id")   # case tile matches destination tile
+  ) %>%
+  rename(
+    tile_d = tile_id,    # destination tile (case)
+    tile_o = o_tile_id   # origin tile
+  )
+
+make_flow_lines <- function(flows_df) {
+  flows_df %>%
+    # origin coords + elevation
+    left_join(
+      tile_centers %>%
+        rename(
+          lon_o     = lon,
+          lat_o     = lat,
+          elev_o_ft = elev_min_ft
+        ),
+      by = c("tile_o" = "tile_id")
+    ) %>%
+    # destination coords + elevation
+    left_join(
+      tile_centers %>%
+        rename(
+          lon_d     = lon,
+          lat_d     = lat,
+          elev_d_ft = elev_min_ft
+        ),
+      by = c("tile_d" = "tile_id")
+    ) %>%
+    filter(
+      !is.na(lon_o), !is.na(lat_o),
+      !is.na(lon_d), !is.na(lat_d)
+    ) %>%
+    mutate(
+      geometry = purrr::pmap(
+        list(lon_o, lat_o, lon_d, lat_d),
+        ~ st_linestring(matrix(c(..1, ..3, ..2, ..4), ncol = 2, byrow = FALSE))
+      )
+    ) %>%
+    st_as_sf(crs = 4326)
+}
+
+flows_out_sf <- make_flow_lines(flows_out_raw) %>%
+  mutate(direction = "Outgoing")
+
+flows_in_sf <- make_flow_lines(flows_in_raw) %>%
+  mutate(direction = "Incoming")
+
+# This is the object you'll feed to Shiny
+flows_all_elev <- bind_rows(flows_out_sf, flows_in_sf)
+
+# --------------------------------------------------------------------
+#Save outputs for Shiny / downstream scripts
+# --------------------------------------------------------------------
+saveRDS(flows_all_elev, file.path(data_dir, "flows_all_elev.rds"))
+```
+
+
+More pre processing
+```{r more pre processing}
+
+flows_slim <- flows_all_elev %>%
+  transmute(
+    case_id,
+    direction,           # "Incoming" / "Outgoing"
+    tile_o,
+    tile_d,
+    elev_o = elev_o_ft,
+    elev_d = elev_d_ft,
+    ds = as.Date(ds),
+    geometry
+  ) %>%
+  st_as_sf(crs = 4326)   # make sure CRS is set, but do NOT re-transform later in Shiny
+
+#drop district centroid and san jose cases
+cases_all <- mal23_pts %>%
+  st_transform(4326) %>%
+  filter(
+    locality_source != "district_centroid",
+    PROVINCIA != "SAN JOSE"
+  ) %>%
+  mutate(symptom_onset = as.Date(`FECHA INICIO SÍNTOMAS`)) %>%
+  select(case_id, PROVINCIA, symptom_onset, geometry, locality_source)
+
+
+# drop trips where O or D is over 1000m elevation
+valid_case_ids <- unique(cases_all$case_id)
+
+flows_slim <- flows_slim %>%
+  filter(
+    case_id %in% valid_case_ids,
+    !is.na(elev_o), !is.na(elev_d),
+    elev_o < 1000, elev_d < 1000
+  )
+
+# (optional, but helps avoid degenerate zero-length lines)
+# drop trips where origin and destination tiles are the same
+flows_slim <- flows_slim %>%
+  filter(tile_o != tile_d)
+
+# split trips in and trips out
+flows_in_all  <- flows_slim %>% filter(direction == "Incoming")
+flows_out_all <- flows_slim %>% filter(direction == "Outgoing")
+
+# if there's multiple rows with same origin/dest/case, aggregate:
+# flows_in_all <- flows_in_all %>%
+#   group_by(case_id, tile_o, tile_d) %>%
+#   summarise(geometry = sf::st_union(geometry), .groups = "drop") %>%
+#   mutate(direction = "Incoming")
+# 
+# flows_out_all <- flows_out_all %>%
+#   group_by(case_id, tile_o, tile_d) %>%
+#   summarise(geometry = sf::st_union(geometry), .groups = "drop") %>%
+#   mutate(direction = "Outgoing")
+
+
+
+# Simplify district geometries (ok to simplify polygons)
+districts_base <- districts_min %>%
+  sf::st_transform(4326) %>%
+  sf::st_simplify(dTolerance = 0.001, preserveTopology = TRUE)
+
+# Simplify flows but **preserve topology** so they stay as lines
+flows_in_all  <- sf::st_simplify(flows_in_all,  dTolerance = 0.0005, preserveTopology = TRUE)
+flows_out_all <- sf::st_simplify(flows_out_all, dTolerance = 0.0005, preserveTopology = TRUE)
+
+#save data for shiny app
+shiny_data <- list(
+  districts_base = districts_base,
+  cases_all      = cases_all,
+  flows_in_all   = flows_in_all,
+  flows_out_all  = flows_out_all
+)
+
+saveRDS(shiny_data, "shiny_mobility_data.rds")
+```
+

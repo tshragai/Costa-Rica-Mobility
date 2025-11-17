@@ -1,0 +1,12 @@
+name: Visualize_CR_mobility_data
+title: Visualize_CR_mobility_data
+username: tshragaistanford
+account: tshragaistanford
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 15966244
+bundleId: 11131479
+url: https://tshragaistanford.shinyapps.io/Visualize_CR_mobility_data/
+version: 1
+asMultiple: FALSE
+asStatic: FALSE
