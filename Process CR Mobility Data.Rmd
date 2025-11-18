@@ -340,3 +340,5 @@ st_write(districts, "data/Costa_Rica_districts.gpkg", delete_dsn = TRUE)
 
 rm(district_activity,districts_m, home_info, home_sf, home_with_pop, ix, tiles_m)
 ```
+
+

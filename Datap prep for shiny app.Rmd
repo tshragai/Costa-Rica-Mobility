@@ -99,6 +99,11 @@ districts_min <- districts %>%
 #save for reuse in Shiny
 saveRDS(districts_min, file.path(data_dir, "districts_min.rds"))
 
+################################################################################
+#population per tile data
+setwd("~/Costa-Rica-Mobility/Data")
+pop_tiles <- st_read("costa_rica_activity_tiles_population.geojson")  
+
 ```
 
 ```{r more data prep}
@@ -211,82 +216,90 @@ saveRDS(flows_all_elev, file.path(data_dir, "flows_all_elev.rds"))
 ```
 
 
+
+
+
+
 More pre processing
 ```{r more pre processing}
+# --------------------------------------------------------------------
+# More pre processing: add people_travel and direction
+# --------------------------------------------------------------------
 
+# 1) Case home tile lookup (from mal23_pts which already has tile_id from earlier)
+case_home <- mal23_pts %>%
+  st_drop_geometry() %>%
+  dplyr::select(case_id, tile_id) %>%
+  dplyr::distinct()
+
+# 2) Add people_travel + case_tile + direction to flows_all_elev
+flows_all_elev <- flows_all_elev %>%
+  # population-weighted people traveling for this record
+  dplyr::mutate(people_travel = visit_fraction * origin_pop) %>%
+  # attach the case's home tile
+  dplyr::left_join(case_home, by = "case_id") %>%
+  dplyr::rename(case_tile = tile_id) %>%
+  # classify direction relative to the case tile
+  dplyr::mutate(
+    direction = dplyr::case_when(
+      tile_o == case_tile ~ "Outgoing",
+      tile_d == case_tile ~ "Incoming",
+      TRUE                ~ NA_character_
+    )
+  )
+
+# 3) Build slim object with direction + people_travel
 flows_slim <- flows_all_elev %>%
-  transmute(
+  dplyr::transmute(
     case_id,
-    direction,           # "Incoming" / "Outgoing"
+    direction,                 # "Incoming" / "Outgoing"
+    case_tile,                 # tile where the case lives
     tile_o,
     tile_d,
     elev_o = elev_o_ft,
     elev_d = elev_d_ft,
     ds = as.Date(ds),
+    people_travel,             # *** this is the one you care about ***
+    origin_pop,
+    visit_fraction,
     geometry
   ) %>%
-  st_as_sf(crs = 4326)   # make sure CRS is set, but do NOT re-transform later in Shiny
+  st_as_sf(crs = 4326)
 
-#drop district centroid and san jose cases
+# 4) Drop district centroid + San José cases and apply elevation filters
 cases_all <- mal23_pts %>%
   st_transform(4326) %>%
-  filter(
+  dplyr::filter(
     locality_source != "district_centroid",
     PROVINCIA != "SAN JOSE"
   ) %>%
-  mutate(symptom_onset = as.Date(`FECHA INICIO SÍNTOMAS`)) %>%
-  select(case_id, PROVINCIA, symptom_onset, geometry, locality_source)
+  dplyr::mutate(symptom_onset = as.Date(`FECHA INICIO SÍNTOMAS`)) %>%
+  dplyr::select(case_id, PROVINCIA, symptom_onset, geometry, locality_source)
 
-
-# drop trips where O or D is over 1000m elevation
 valid_case_ids <- unique(cases_all$case_id)
 
 flows_slim <- flows_slim %>%
-  filter(
+  dplyr::filter(
     case_id %in% valid_case_ids,
+    !is.na(direction),
     !is.na(elev_o), !is.na(elev_d),
-    elev_o < 1000, elev_d < 1000
+    elev_o < 1000, elev_d < 1000,
+    tile_o != tile_d          # drop zero-length trips
   )
 
-# (optional, but helps avoid degenerate zero-length lines)
-# drop trips where origin and destination tiles are the same
-flows_slim <- flows_slim %>%
-  filter(tile_o != tile_d)
-
-# split trips in and trips out
-flows_in_all  <- flows_slim %>% filter(direction == "Incoming")
-flows_out_all <- flows_slim %>% filter(direction == "Outgoing")
-
-# if there's multiple rows with same origin/dest/case, aggregate:
-# flows_in_all <- flows_in_all %>%
-#   group_by(case_id, tile_o, tile_d) %>%
-#   summarise(geometry = sf::st_union(geometry), .groups = "drop") %>%
-#   mutate(direction = "Incoming")
-# 
-# flows_out_all <- flows_out_all %>%
-#   group_by(case_id, tile_o, tile_d) %>%
-#   summarise(geometry = sf::st_union(geometry), .groups = "drop") %>%
-#   mutate(direction = "Outgoing")
-
-
-
-# Simplify district geometries (ok to simplify polygons)
-districts_base <- districts_min %>%
-  sf::st_transform(4326) %>%
-  sf::st_simplify(dTolerance = 0.001, preserveTopology = TRUE)
-
-# Simplify flows but **preserve topology** so they stay as lines
-flows_in_all  <- sf::st_simplify(flows_in_all,  dTolerance = 0.0005, preserveTopology = TRUE)
-flows_out_all <- sf::st_simplify(flows_out_all, dTolerance = 0.0005, preserveTopology = TRUE)
+# 5) Split trips in and out
+flows_in_all  <- flows_slim %>% dplyr::filter(direction == "Incoming")
+flows_out_all <- flows_slim %>% dplyr::filter(direction == "Outgoing")
 
 #save data for shiny app
 shiny_data <- list(
   districts_base = districts_base,
+  flows_slim = flows_slim,
   cases_all      = cases_all,
   flows_in_all   = flows_in_all,
-  flows_out_all  = flows_out_all
+  flows_out_all  = flows_out_all,
+  tiles_base = pop_tiles
 )
 
 saveRDS(shiny_data, "shiny_mobility_data.rds")
 ```
-
