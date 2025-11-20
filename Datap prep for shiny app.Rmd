@@ -303,3 +303,117 @@ shiny_data <- list(
 
 saveRDS(shiny_data, "shiny_mobility_data.rds")
 ```
+
+
+static map
+```{r static map}
+
+
+flows_case_od <- flows_out_all
+
+# avoid issues if very small n
+if (nrow(flows_case_od) > 0) {
+  brks <- quantile(flows_case_od$people_travel,
+                   probs = c(0, 0.8, 0.95, 1),
+                   na.rm = TRUE)
+  # if quantiles collapse, jitter slightly
+  brks[duplicated(brks)] <- brks[duplicated(brks)] + 1e-6
+} else {
+  brks <- c(0, 1, 2, 3)
+}
+
+flows_case_od <- flows_case_od %>%
+  mutate(
+    flow_cat = cut(
+      people_travel,
+      breaks = brks,
+      include.lowest = TRUE,
+      labels = c("small", "medium", "large")
+    )
+  )
+
+set.seed(123)
+
+small_n <- min(nrow(flows_case_od %>% filter(flow_cat == "small")), 3000)
+
+small_flows <- flows_case_od %>%
+  filter(flow_cat == "small") %>%
+  slice_sample(n = small_n)
+
+flows_case_plot <- bind_rows(
+  small_flows,
+  flows_case_od %>% filter(flow_cat != "small")
+)
+
+
+p_flows <- ggplot() +
+  # base map
+  geom_sf(data = districts_min,
+          fill = "grey97",
+          color = "grey80",
+          linewidth = 0.2) +
+  
+  # tiles
+  geom_sf(data = pop_tiles,
+          fill = NA,
+          color = "grey90",
+          linewidth = 0.15) +
+  
+  # highlight tiles that have malaria cases (optional but nice)
+  #geom_sf(data = case_tiles_sf,
+         # fill = NA,
+         # color = "firebrick",
+         # linewidth = 0.4) +
+  
+  # flows – use the sampled / categorized df
+  geom_sf(data = flows_case_plot,
+          aes(linewidth = flow_cat,
+              alpha    = flow_cat),
+          color = "steelblue4",
+          lineend = "round",
+          show.legend = "line") +
+  
+  # malaria cases as points
+  geom_sf(data = mal23_pts,
+          aes(color = "Malaria case"),
+          size = 0.5,
+          alpha = 0.9,
+          show.legend = TRUE) +
+  
+  scale_linewidth_manual(
+    name   = "Travel volume",
+    values = c(
+      "small"  = 0.1,
+      "medium" = 0.4,
+      "large"  = 0.8
+    )
+  ) +
+  scale_alpha_manual(
+    name   = "Travel volume",
+    values = c(
+      "small"  = 0.05,
+      "medium" = 0.2,
+      "large"  = 0.6
+    )
+  ) +
+  scale_color_manual(
+    name   = NULL,
+    values = c("Malaria case" = "darkred")
+  ) +
+  coord_sf() +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    panel.grid.major = element_blank(),
+    axis.title = element_blank(),
+    axis.text = element_blank()
+  ) +
+  labs(
+    title    = "Malaria cases and connected mobility flows",
+    subtitle = "Flows shown only if origin or destination tile includes ≥1 malaria case"
+  )
+
+p_flows
+```
+
+
