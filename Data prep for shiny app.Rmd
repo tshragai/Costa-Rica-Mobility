@@ -4,6 +4,39 @@ output: html_document
 date: "2025-11-17"
 ---
 
+<!--
+================================================================================
+DATA PREPARATION PIPELINE FOR SHINY APP
+================================================================================
+
+This script processes raw data files and creates the following outputs:
+
+OUTPUT FILES CREATED:
+1. malaria_cases_2023_points.rds
+   - Spatial points for malaria cases (2023)
+   - Used in: Visualization, spatial joins, Shiny app
+
+2. districts_polygons_minimal.rds  
+   - Minimal district polygons (province, district, geometry only)
+   - Used in: Shiny app base map, district-level visualizations
+
+3. mobility_flows_with_elevation.rds
+   - Mobility flow lines with elevation data
+   - Used in: Flow visualization, travel pattern analysis
+
+4. shiny_mobility_data.rds (in Visualize_CR_mobility_data/Data/)
+   - Compiled data package for Shiny app
+   - Contains: districts, cases, tiles, weekly travel aggregations
+
+DATA FLOW:
+Raw data → Process malaria data.Rmd → malaria_cases_2023_geocoded.rds
+Raw data → Process CR Mobility Data.Rmd → activity tiles, ca_aug.csv
+Python script → costa_rica_activity_tiles_population.geojson
+This script → Processes all above → Creates outputs for Shiny app
+
+================================================================================
+-->
+
 ```{r setup, include=FALSE}
 # ------------------------------------------------------------------------------
 # Setup: Load libraries and set paths
@@ -30,22 +63,45 @@ shiny_data_dir <- file.path(proj_root, "Visualize_CR_mobility_data/Data")
 # Load Base Data Files
 # ------------------------------------------------------------------------------
 # All data files are loaded once at the beginning for efficiency
+#
+# DATA SOURCES:
+# - malaria_cases_2023_geocoded.rds: Geocoded malaria cases from 2023 with final coordinates
+#   Created by: Process CR malaria data.Rmd
+#   Used for: Creating spatial point locations for malaria cases
+#
+# - activity_by_pop_tiles_overall_wgs84.geojson: Activity tiles with population 
+#   and activity metrics aggregated across all dates
+#   Created by: Process CR Mobility Data.Rmd
+#   Used for: Getting elevation data and activity metrics per tile
+#
+# - costa_rica_activity_tiles_population.geojson: Base tile polygons with 
+#   population estimates from GHSL (2025) and WorldPop (2020)
+#   Created by: calculate_population_new_tiles.py
+#   Used for: Population data per tile for analysis and visualization
+#
+# - ca_aug.csv: Augmented mobility flow data with origin/destination tiles
+#   Created by: Process CR Mobility Data.Rmd
+#   Used for: Building flow lines connecting tiles with malaria cases
+#
+# - Costa_Rica_districts.gpkg: Full district polygon boundaries for Costa Rica
+#   Source: External shapefile data
+#   Used for: Creating minimal district polygons for Shiny app
 
-# Malaria data with point locations
-mal23_merged <- readRDS(file.path(data_dir, "mal23_merged.rds"))
+# Load geocoded malaria cases (2023) - contains final lat/lon coordinates
+mal23_merged <- readRDS(file.path(data_dir, "malaria_cases_2023_geocoded.rds"))
 
-# Activity tiles with population data
+# Load activity tiles with population and activity metrics (aggregated overall)
 mob <- st_read(file.path(data_dir, "activity_by_pop_tiles_overall_wgs84.geojson")) %>%
   st_make_valid() %>%
   st_transform(4326)
 
-# Population per tile data (new dataset)
+# Load base tile polygons with population estimates (GHSL 2025, WorldPop 2020)
 pop_tiles <- st_read(file.path(data_dir, "costa_rica_activity_tiles_population.geojson"))
 
-# Full mobility flow data
+# Load augmented mobility flow data (origin/destination tile assignments)
 ca_aug <- fread(file.path(data_dir, "ca_aug.csv"))
 
-# District polygons
+# Load full district polygon boundaries
 districts <- st_read(file.path(data_dir, "Costa_Rica_districts.gpkg")) %>%
   st_make_valid()
 
@@ -74,6 +130,13 @@ make_key <- function(prov, dist) paste(norm_txt(prov), norm_txt(dist), sep = " |
 # ------------------------------------------------------------------------------
 # Process Malaria Case Points
 # ------------------------------------------------------------------------------
+# Creates: malaria_cases_2023_points.rds
+# Purpose: Convert geocoded malaria cases to spatial point objects
+#          Each point represents one malaria case with its location
+#          Used for: Spatial joins to assign cases to tiles, visualization
+#
+# OUTPUT: malaria_cases_2023_points.rds - Spatial points (sf object) with case_id and coordinates
+
 # Create spatial points from malaria data
 mal23_pts <- mal23_merged %>%
   filter(!is.na(lon_final), !is.na(lat_final)) %>%
@@ -83,7 +146,7 @@ mal23_pts <- mal23_merged %>%
            remove = FALSE)
 
 # Save processed points for reuse
-saveRDS(mal23_pts, file.path(data_dir, "mal23_pts.rds"))
+saveRDS(mal23_pts, file.path(data_dir, "malaria_cases_2023_points.rds"))
 
 # Clean up: remove original merged data (points version is what we use)
 rm(mal23_merged)
@@ -93,6 +156,14 @@ rm(mal23_merged)
 # ------------------------------------------------------------------------------
 # Process District Polygons
 # ------------------------------------------------------------------------------
+# Creates: districts_polygons_minimal.rds
+# Purpose: Extract minimal district information (province, district, geometry)
+#          Standardize names for matching with malaria data
+#          Used for: Shiny app base map, district-level visualizations
+#
+# OUTPUT: districts_polygons_minimal.rds - Minimal district polygons (sf object) with 
+#         province, district, and matching key
+
 # Extract and standardize district information
 # NOMB_UGEP = Province, NOMB_UGED = District
 districts_min <- districts %>%
@@ -104,7 +175,7 @@ districts_min <- districts %>%
   mutate(key = make_key(PROV_SHP, DIST_SHP))
 
 # Save for reuse in Shiny
-saveRDS(districts_min, file.path(data_dir, "districts_min.rds"))
+saveRDS(districts_min, file.path(data_dir, "districts_polygons_minimal.rds"))
 
 # Create base districts object for Shiny (alias for consistency)
 districts_base <- districts_min
@@ -194,6 +265,16 @@ tile_centers <- mob %>%
 # ------------------------------------------------------------------------------
 # Build Flow Lines (Outgoing & Incoming) with Elevation
 # ------------------------------------------------------------------------------
+# Creates: mobility_flows_with_elevation.rds
+# Purpose: Create spatial flow lines connecting tiles with malaria cases
+#          Includes elevation data for origin and destination tiles
+#          Used for: Visualizing mobility patterns, flow analysis
+#
+# OUTPUT: mobility_flows_with_elevation.rds - Spatial flow lines (sf object) with:
+#         - Origin/destination tile IDs
+#         - Elevation (feet) for origin and destination
+#         - Case ID associations
+#         - Direction (Outgoing/Incoming) relative to case tile
 # OUTGOING: case tile is origin
 flows_out_raw <- cases_tiles %>%
   inner_join(
@@ -264,8 +345,8 @@ flows_in_sf <- make_flow_lines(flows_in_raw) %>%
 # Combine all flows
 flows_all_elev <- bind_rows(flows_out_sf, flows_in_sf)
 
-# Save intermediate output
-saveRDS(flows_all_elev, file.path(data_dir, "flows_all_elev.rds"))
+# Save intermediate output (flow lines with elevation data)
+saveRDS(flows_all_elev, file.path(data_dir, "mobility_flows_with_elevation.rds"))
 
 # Clean up: remove raw flow dataframes (sf versions are what we use)
 rm(flows_out_raw, flows_in_raw, flows_out_sf, flows_in_sf)
@@ -358,6 +439,18 @@ rm(valid_case_ids)
 # ------------------------------------------------------------------------------
 # Calculate Weekly Travel Aggregations
 # ------------------------------------------------------------------------------
+# Creates: travel_df_week (in-memory data frame, included in shiny_data)
+# Purpose: Aggregate outgoing travel from malaria case tiles by week
+#          For each week, sum people traveling to each destination tile
+#          Used for: Shiny app time-series visualization of travel patterns
+#
+# OUTPUT: travel_df_week - Data frame with one row per (week_start, tile_id):
+#         - week_start: Week start date (Monday)
+#         - tile_id: Destination tile ID
+#         - people: Total people traveling to this tile from case tiles in that week
+#
+# Note: This is included in shiny_mobility_data.rds for the Shiny app
+
 # Add week_start to cases
 cases_all_weeks <- cases_all %>%
   mutate(
@@ -416,15 +509,25 @@ rm(all_weeks, cases_all_weeks)
 # ------------------------------------------------------------------------------
 # Save Final Data for Shiny App
 # ------------------------------------------------------------------------------
+# Creates: shiny_mobility_data.rds (in Visualize_CR_mobility_data/Data/)
+# Purpose: Compile all processed data needed for the Shiny app
+#          Used for: Interactive visualization application
+#
+# OUTPUT: shiny_mobility_data.rds - List containing:
+#         - districts_base: Minimal district polygons for base map
+#         - cases_all: Filtered malaria cases with symptom onset dates
+#         - tiles_base: Tile polygons with population data
+#         - travel_df_week: Weekly aggregated travel from case tiles
+
 # Create tiles_base alias for consistency with Shiny app
 tiles_base <- pop_tiles
 
 # Compile all data needed for Shiny app
 shiny_data <- list(
-  districts_base = districts_base,
-  cases_all      = cases_all,
-  tiles_base     = tiles_base,
-  travel_df_week = travel_df_week
+  districts_base = districts_base,  # District polygons for base map
+  cases_all      = cases_all,        # Filtered malaria cases
+  tiles_base     = tiles_base,       # Tile polygons with population
+  travel_df_week = travel_df_week   # Weekly travel aggregations
 )
 
 # Save to Shiny app data directory
@@ -438,8 +541,19 @@ rm(norm_txt, make_key, districts_base, tiles_base)
 # ------------------------------------------------------------------------------
 # Aggregate Travel from Tiles with Malaria Cases
 # ------------------------------------------------------------------------------
-# Create data frame with one row per tile showing total people traveling in
-# from tiles that have malaria cases
+# Creates: tile_travel_from_malaria (in-memory data frame, not saved)
+# Purpose: Calculate total people traveling INTO each tile FROM tiles with 
+#          malaria cases. Used for risk assessment and exposure analysis.
+#          Used for: Analysis of potential exposure risk per tile
+#
+# OUTPUT: tile_travel_from_malaria - Data frame with one row per tile:
+#         - tile_id: Tile identifier
+#         - total_people_in_from_malaria_tiles: Sum of people traveling in
+#         - n_flows_from_malaria_tiles: Number of incoming flows
+#         - has_malaria_case: Whether this tile has cases
+#         - worldpop_population, ghsl_population_2025: Population data
+#
+# Note: This is an analysis output, not saved to disk
 
 # Get tiles that have malaria cases
 tiles_with_cases <- cases_tiles %>%

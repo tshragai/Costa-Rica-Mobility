@@ -900,7 +900,7 @@ rm(
 
 #Save output to data folder
 setwd("~/Costa-Rica-Mobility/Data")
-saveRDS(mal23_merged, "~/Costa-Rica-Mobility/Data/mal23_merged.rds")
+saveRDS(mal23_merged, "~/Costa-Rica-Mobility/Data/malaria_cases_2023_geocoded.rds")
 ```
 
 

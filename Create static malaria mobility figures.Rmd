@@ -28,23 +28,44 @@ data_dir  <- file.path(proj_root, "Data")
 # Load Required Data Files
 # ------------------------------------------------------------------------------
 # Load all data files needed for visualization
+#
+# DATA SOURCES:
+# - districts_polygons_minimal.rds: Minimal district polygons for base map
+#   Created by: Data prep for shiny app.Rmd
+#   Used for: Base map background in visualizations
+#
+# - costa_rica_activity_tiles_population.geojson: Tile polygons with population
+#   Created by: calculate_population_new_tiles.py
+#   Used for: Showing tile boundaries and population data
+#
+# - activity_by_pop_tiles_overall_wgs84.geojson: Activity tiles with elevation
+#   Created by: Process CR Mobility Data.Rmd
+#   Used for: Getting elevation data to join with population tiles
+#
+# - malaria_cases_2023_points.rds: Spatial points for malaria cases
+#   Created by: Data prep for shiny app.Rmd
+#   Used for: Plotting case locations on maps
+#
+# - mobility_flows_with_elevation.rds: Mobility flow lines with elevation
+#   Created by: Data prep for shiny app.Rmd
+#   Used for: Visualizing travel patterns from case tiles
 
-# District polygons (minimal version)
-districts_min <- readRDS(file.path(data_dir, "districts_min.rds"))
+# Load minimal district polygons (for base map)
+districts_min <- readRDS(file.path(data_dir, "districts_polygons_minimal.rds"))
 
-# Population per tile data
+# Load tile polygons with population estimates (GHSL 2025, WorldPop 2020)
 pop_tiles <- st_read(file.path(data_dir, "costa_rica_activity_tiles_population.geojson"))
 
-# Activity tiles with elevation data (for joining elevation to pop_tiles)
+# Load activity tiles with elevation data (for joining elevation to pop_tiles)
 mob <- st_read(file.path(data_dir, "activity_by_pop_tiles_overall_wgs84.geojson")) %>%
   st_make_valid() %>%
   st_transform(4326)
 
-# Malaria case points
-mal23_pts <- readRDS(file.path(data_dir, "mal23_pts.rds"))
+# Load malaria case spatial points
+mal23_pts <- readRDS(file.path(data_dir, "malaria_cases_2023_points.rds"))
 
-# Flow data with elevation
-flows_all_elev <- readRDS(file.path(data_dir, "flows_all_elev.rds"))
+# Load flow lines with elevation data
+flows_all_elev <- readRDS(file.path(data_dir, "mobility_flows_with_elevation.rds"))
 
 # Clean up: remove proj_root (no longer needed)
 rm(proj_root)
