@@ -132,8 +132,9 @@ rm(M, pts_ll, pts_m, squares_ll, squares_m, XY)
 
 read in population data, created in Python/GEE using GHSL and WorldPop
 ```{r population data}
-setwd("~/Costa-Rica-Mobility/Data")
-pop_tiles <- st_read("costa_rica_activity_tiles_population.geojson")  
+# Read population data from Data folder
+data_dir <- path.expand("~/Costa-Rica-Mobility/Data")
+pop_tiles <- st_read(file.path(data_dir, "costa_rica_activity_tiles_population.geojson"))  
 
 #worldpop or GHSL
 pop_tiles <- pop_tiles %>%
