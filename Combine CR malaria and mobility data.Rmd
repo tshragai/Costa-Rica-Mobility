@@ -185,7 +185,7 @@ districts_min <- districts %>%
   transmute(
     PROV_SHP = NOMB_UGEP,
     DIST_SHP = NOMB_UGED,
-    geom     = geometry
+    geom     = geom
   ) %>%
   mutate(key = make_key(PROV_SHP, DIST_SHP))
 
@@ -621,9 +621,33 @@ tile_travel_from_malaria <- flows_in_all %>%
     by = "tile_id"
   ) %>%
   # Arrange by total people in (descending)
-  arrange(desc(total_people_in_from_malaria_tiles))
+  arrange(desc(total_people_in_from_malaria_tiles))%>%
+  # Join with population + elevation data
+  left_join(
+    mob %>% 
+      st_drop_geometry() %>% 
+      select(tile_id, elev_min_m),
+    by = "tile_id"
+  )  
 
 # Clean up: remove intermediate objects
 rm(tiles_with_cases)
+
+tile_travel_from_malaria_low <- tile_travel_from_malaria %>%
+  filter(!is.na(elev_min_m), elev_min_m < 1000)
+
+ggplot(
+  tile_travel_from_malaria_low,
+  aes(x = has_malaria_case, y = log(total_people_in_from_malaria_tiles+1))
+) +
+  geom_boxplot() +
+  scale_x_discrete(labels = c("FALSE" = "No malaria case", "TRUE" = "Has malaria case")) +
+  labs(
+    title = "Incoming travel from malaria tiles (<1000 m elevation)",
+    x = "Tile has malaria case",
+    y = "Total people traveling in from malaria tiles"
+  ) +
+  theme_minimal()
+
 ```
 
