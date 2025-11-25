@@ -32,13 +32,19 @@ Create tiles from lat/lon points provided by Meta
 drive_auth()
 target_folder <- as_id("1j9yE_C6okSNO73RROigLONOU9VGZ9wJa")
 tmp_csv <- tempfile(fileext = ".csv")
-file_info <- drive_find(pattern = "all_processed_combined.csv", path = target_folder)
+
+# List files in the folder and find the one we need
+folder_files <- drive_ls(path = target_folder)
+file_info <- folder_files[folder_files$name == "all_processed_combined.csv", ]
+
 if (nrow(file_info) > 0) {
   drive_download(file = as_id(file_info$id[1]), path = tmp_csv, overwrite = TRUE)
   ca_data <- read.csv(tmp_csv)
   unlink(tmp_csv)  # Clean up temporary file
+  message("✓ Successfully loaded all_processed_combined.csv from Google Drive")
 } else {
-  stop("File 'all_processed_combined.csv' not found in Google Drive folder")
+  stop("File 'all_processed_combined.csv' not found in Google Drive folder. Available files: ", 
+       paste(folder_files$name, collapse = ", "))
 }
 
 # 1) Unique visit centroids in WGS84
@@ -285,13 +291,19 @@ Plot it in Leaflet
 drive_auth()
 target_folder <- as_id("1j9yE_C6okSNO73RROigLONOU9VGZ9wJa")
 tmp_geojson <- tempfile(fileext = ".geojson")
-file_info <- drive_find(pattern = "activity_by_pop_tiles_overall_wgs84.geojson", path = target_folder)
+
+# List files in the folder and find the one we need
+folder_files <- drive_ls(path = target_folder)
+file_info <- folder_files[folder_files$name == "activity_by_pop_tiles_overall_wgs84.geojson", ]
+
 if (nrow(file_info) > 0) {
   drive_download(file = as_id(file_info$id[1]), path = tmp_geojson, overwrite = TRUE)
   tile_activity_overall_ll <- st_read(tmp_geojson)
   unlink(tmp_geojson)  # Clean up temporary file
+  message("✓ Successfully loaded activity_by_pop_tiles_overall_wgs84.geojson from Google Drive")
 } else {
-  stop("File 'activity_by_pop_tiles_overall_wgs84.geojson' not found in Google Drive folder")
+  stop("File 'activity_by_pop_tiles_overall_wgs84.geojson' not found in Google Drive folder. Available files: ", 
+       paste(folder_files$name, collapse = ", "))
 }  
 
 tile_activity_lonlat<-tile_activity_overall_ll%>%
