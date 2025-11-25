@@ -27,9 +27,19 @@ Create tiles from lat/lon points provided by Meta
 
 ```{r create tiles}
 
-## --- Read in activity data ---
-setwd("~/Downloads")
-ca_data <- read.csv("all_processed_combined.csv")
+## --- Read in activity data from Google Drive ---
+# Download from Google Drive and read
+drive_auth()
+target_folder <- as_id("1j9yE_C6okSNO73RROigLONOU9VGZ9wJa")
+tmp_csv <- tempfile(fileext = ".csv")
+file_info <- drive_find(pattern = "all_processed_combined.csv", path = target_folder)
+if (nrow(file_info) > 0) {
+  drive_download(file = as_id(file_info$id[1]), path = tmp_csv, overwrite = TRUE)
+  ca_data <- read.csv(tmp_csv)
+  unlink(tmp_csv)  # Clean up temporary file
+} else {
+  stop("File 'all_processed_combined.csv' not found in Google Drive folder")
+}
 
 # 1) Unique visit centroids in WGS84
 pts_ll <- st_as_sf(
