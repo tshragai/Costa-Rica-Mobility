@@ -31,7 +31,7 @@ data_dir  <- file.path(proj_root, "Data")
 #
 # DATA SOURCES:
 # - districts_polygons_minimal.rds: Minimal district polygons for base map
-#   Created by: Data prep for shiny app.Rmd
+#   Created by: Combine CR malaria and mobility data.Rmd
 #   Used for: Base map background in visualizations
 #
 # - costa_rica_activity_tiles_population.geojson: Tile polygons with population
@@ -43,11 +43,11 @@ data_dir  <- file.path(proj_root, "Data")
 #   Used for: Getting elevation data to join with population tiles
 #
 # - malaria_cases_2023_points.rds: Spatial points for malaria cases
-#   Created by: Data prep for shiny app.Rmd
+#   Created by: Combine CR malaria and mobility data.Rmd
 #   Used for: Plotting case locations on maps
 #
 # - mobility_flows_with_elevation.rds: Mobility flow lines with elevation
-#   Created by: Data prep for shiny app.Rmd
+#   Created by: Combine CR malaria and mobility data.Rmd
 #   Used for: Visualizing travel patterns from case tiles
 
 # Load minimal district polygons (for base map)

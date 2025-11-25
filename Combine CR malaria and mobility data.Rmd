@@ -1,12 +1,12 @@
 ---
-title: "Data prep for shiny app"
+title: "Combine CR malaria and mobility data"
 output: html_document
 date: "2025-11-17"
 ---
 
 <!--
 ================================================================================
-DATA PREPARATION PIPELINE FOR SHINY APP
+COMBINE COSTA RICA MALARIA AND MOBILITY DATA
 ================================================================================
 
 This script processes raw data files and creates the following outputs:
