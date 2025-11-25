@@ -1,0 +1,682 @@
+---
+title: "Data prep for shiny app"
+output: html_document
+date: "2025-11-17"
+---
+
+```{r setup, include=FALSE}
+# ------------------------------------------------------------------------------
+# Setup: Load libraries and set paths
+# ------------------------------------------------------------------------------
+knitr::opts_chunk$set(echo = TRUE)
+
+# Load required libraries
+library(dplyr)
+library(sf)
+library(lubridate)
+library(data.table)
+library(terra)
+library(elevatr)
+library(purrr)
+
+# Set project root and data directory paths
+proj_root <- "~/Costa-Rica-Mobility"
+data_dir  <- file.path(proj_root, "Data")
+shiny_data_dir <- file.path(proj_root, "Visualize_CR_mobility_data/Data")
+```
+
+```{r load-base-data}
+# ------------------------------------------------------------------------------
+# Load Base Data Files
+# ------------------------------------------------------------------------------
+# All data files are loaded once at the beginning for efficiency
+
+# Malaria data with point locations
+mal23_merged <- readRDS(file.path(data_dir, "mal23_merged.rds"))
+
+# Activity tiles with population data
+mob <- st_read(file.path(data_dir, "activity_by_pop_tiles_overall_wgs84.geojson")) %>%
+  st_make_valid() %>%
+  st_transform(4326)
+
+# Population per tile data (new dataset)
+pop_tiles <- st_read(file.path(data_dir, "costa_rica_activity_tiles_population.geojson"))
+
+# Full mobility flow data
+ca_aug <- fread(file.path(data_dir, "ca_aug.csv"))
+
+# District polygons
+districts <- st_read(file.path(data_dir, "Costa_Rica_districts.gpkg")) %>%
+  st_make_valid()
+
+# Clean up temporary variables
+rm(proj_root)
+```
+
+```{r helper-functions}
+# ------------------------------------------------------------------------------
+# Helper Functions
+# ------------------------------------------------------------------------------
+# Text normalization function for district name matching
+norm_txt <- function(x) {
+  x |>
+    tolower() |>
+    stringi::stri_trans_general("Latin-ASCII") |>
+    trimws() |>
+    gsub("\\s+", " ", x = _)
+}
+
+# Create matching key from province and district names
+make_key <- function(prov, dist) paste(norm_txt(prov), norm_txt(dist), sep = " | ")
+```
+
+```{r process-malaria-points}
+# ------------------------------------------------------------------------------
+# Process Malaria Case Points
+# ------------------------------------------------------------------------------
+# Create spatial points from malaria data
+mal23_pts <- mal23_merged %>%
+  filter(!is.na(lon_final), !is.na(lat_final)) %>%
+  mutate(case_id = row_number()) %>%
+  st_as_sf(coords = c("lon_final", "lat_final"),
+           crs = 4326,
+           remove = FALSE)
+
+# Save processed points for reuse
+saveRDS(mal23_pts, file.path(data_dir, "mal23_pts.rds"))
+
+# Clean up: remove original merged data (points version is what we use)
+rm(mal23_merged)
+```
+
+```{r process-districts}
+# ------------------------------------------------------------------------------
+# Process District Polygons
+# ------------------------------------------------------------------------------
+# Extract and standardize district information
+# NOMB_UGEP = Province, NOMB_UGED = District
+districts_min <- districts %>%
+  transmute(
+    PROV_SHP = NOMB_UGEP,
+    DIST_SHP = NOMB_UGED,
+    geom     = geometry
+  ) %>%
+  mutate(key = make_key(PROV_SHP, DIST_SHP))
+
+# Save for reuse in Shiny
+saveRDS(districts_min, file.path(data_dir, "districts_min.rds"))
+
+# Create base districts object for Shiny (alias for consistency)
+districts_base <- districts_min
+
+# Clean up: remove full districts object (minimal version is what we use)
+rm(districts)
+```
+
+```{r add-elevation-to-tiles}
+# ------------------------------------------------------------------------------
+# Add Elevation Data to Activity Tiles
+# ------------------------------------------------------------------------------
+# Get elevation raster for tile locations
+dem_r <- get_elev_raster(
+  locations = mob,
+  z   = 11,
+  prj = st_crs(mob)$wkt,
+  clip = "bbox"
+)
+
+# Convert to terra format and extract minimum elevation per tile
+dem       <- rast(dem_r)
+mob_terra <- vect(mob)
+
+tile_elev <- terra::extract(
+  dem,
+  mob_terra,
+  fun   = min,
+  na.rm = TRUE,
+  ID    = FALSE
+)
+
+# Add elevation to mobility tiles (meters and feet)
+mob$elev_min_m  <- tile_elev[, 1]
+mob$elev_min_ft <- mob$elev_min_m * 3.28084
+
+# Clean up: remove intermediate elevation processing objects
+rm(dem_r, dem, mob_terra, tile_elev)
+```
+
+```{r assign-cases-to-tiles}
+# ------------------------------------------------------------------------------
+# Assign Malaria Cases to Mobility Tiles
+# ------------------------------------------------------------------------------
+# Create simplified tile geometry for spatial join
+mob_tiles <- mob %>% select(tile_id, geometry)
+
+# Spatial join: assign each case to its containing tile
+cases_tiles <- st_join(
+  mal23_pts %>% select(case_id),
+  mob_tiles,
+  join = st_within,
+  left  = FALSE  # drop cases not in any tile
+) %>%
+  st_drop_geometry() %>%
+  distinct(case_id, tile_id) %>%
+  group_by(case_id) %>%
+  slice(1) %>%
+  ungroup()
+
+# Attach tile_id back to case points
+mal23_pts <- mal23_pts %>%
+  left_join(cases_tiles, by = "case_id")
+
+# Clean up: remove temporary tile geometry object
+rm(mob_tiles)
+```
+
+```{r create-tile-centroids}
+# ------------------------------------------------------------------------------
+# Create Tile Centroids for Flow Line Construction
+# ------------------------------------------------------------------------------
+# Calculate centroids and extract coordinates for each tile
+tile_centers <- mob %>%
+  mutate(cent = st_centroid(geometry)) %>%
+  mutate(
+    lon = st_coordinates(cent)[, 1],
+    lat = st_coordinates(cent)[, 2]
+  ) %>%
+  st_drop_geometry() %>%
+  select(tile_id, lon, lat, elev_min_ft)
+
+# Clean up: no intermediate objects to remove
+```
+
+```{r build-flow-lines}
+# ------------------------------------------------------------------------------
+# Build Flow Lines (Outgoing & Incoming) with Elevation
+# ------------------------------------------------------------------------------
+# OUTGOING: case tile is origin
+flows_out_raw <- cases_tiles %>%
+  inner_join(
+    ca_aug,
+    by = c("tile_id" = "o_tile_id")  # case tile matches origin tile
+  ) %>%
+  rename(
+    tile_o = tile_id,    # origin tile (case)
+    tile_d = d_tile_id   # destination tile
+  )
+
+# INCOMING: case tile is destination
+flows_in_raw <- cases_tiles %>%
+  inner_join(
+    ca_aug,
+    by = c("tile_id" = "d_tile_id")  # case tile matches destination tile
+  ) %>%
+  rename(
+    tile_d = tile_id,    # destination tile (case)
+    tile_o = o_tile_id   # origin tile
+  )
+
+# Function to create flow lines with coordinates and elevation
+make_flow_lines <- function(flows_df) {
+  flows_df %>%
+    # Add origin coordinates + elevation
+    left_join(
+      tile_centers %>%
+        rename(
+          lon_o     = lon,
+          lat_o     = lat,
+          elev_o_ft = elev_min_ft
+        ),
+      by = c("tile_o" = "tile_id")
+    ) %>%
+    # Add destination coordinates + elevation
+    left_join(
+      tile_centers %>%
+        rename(
+          lon_d     = lon,
+          lat_d     = lat,
+          elev_d_ft = elev_min_ft
+        ),
+      by = c("tile_d" = "tile_id")
+    ) %>%
+    # Filter out flows with missing coordinates
+    filter(
+      !is.na(lon_o), !is.na(lat_o),
+      !is.na(lon_d), !is.na(lat_d)
+    ) %>%
+    # Create linestring geometry
+    mutate(
+      geometry = purrr::pmap(
+        list(lon_o, lat_o, lon_d, lat_d),
+        ~ st_linestring(matrix(c(..1, ..3, ..2, ..4), ncol = 2, byrow = FALSE))
+      )
+    ) %>%
+    st_as_sf(crs = 4326)
+}
+
+# Create flow line objects
+flows_out_sf <- make_flow_lines(flows_out_raw) %>%
+  mutate(direction = "Outgoing")
+
+flows_in_sf <- make_flow_lines(flows_in_raw) %>%
+  mutate(direction = "Incoming")
+
+# Combine all flows
+flows_all_elev <- bind_rows(flows_out_sf, flows_in_sf)
+
+# Save intermediate output
+saveRDS(flows_all_elev, file.path(data_dir, "flows_all_elev.rds"))
+
+# Clean up: remove raw flow dataframes (sf versions are what we use)
+rm(flows_out_raw, flows_in_raw, flows_out_sf, flows_in_sf)
+```
+
+```{r add-people-travel-and-direction}
+# ------------------------------------------------------------------------------
+# Add People Travel Metrics and Refine Direction Classification
+# ------------------------------------------------------------------------------
+# Extract case home tile lookup
+case_home <- mal23_pts %>%
+  st_drop_geometry() %>%
+  dplyr::select(case_id, tile_id) %>%
+  dplyr::distinct()
+
+# Add people_travel metric and refine direction classification
+flows_all_elev <- flows_all_elev %>%
+  # Population-weighted people traveling for this record
+  dplyr::mutate(people_travel = visit_fraction * origin_pop) %>%
+  # Attach the case's home tile
+  dplyr::left_join(case_home, by = "case_id") %>%
+  dplyr::rename(case_tile = tile_id) %>%
+  # Classify direction relative to the case tile
+  dplyr::mutate(
+    direction = dplyr::case_when(
+      tile_o == case_tile ~ "Outgoing",
+      tile_d == case_tile ~ "Incoming",
+      TRUE                ~ NA_character_
+    )
+  )
+
+# Build slim object with essential variables
+flows_slim <- flows_all_elev %>%
+  dplyr::transmute(
+    case_id,
+    direction,                 # "Incoming" / "Outgoing"
+    case_tile,                 # tile where the case lives
+    tile_o,
+    tile_d,
+    elev_o = elev_o_ft,
+    elev_d = elev_d_ft,
+    ds = as.Date(ds),
+    people_travel,             
+    origin_pop,
+    visit_fraction,
+    geometry
+  ) %>%
+  st_as_sf(crs = 4326)
+
+# Clean up: remove case_home (already merged into flows)
+rm(case_home)
+```
+
+```{r filter-cases-and-flows}
+# ------------------------------------------------------------------------------
+# Filter Cases and Flows for Analysis
+# ------------------------------------------------------------------------------
+# Drop district centroid cases and San José cases, add symptom onset date
+cases_all <- mal23_pts %>%
+  st_transform(4326) %>%
+  dplyr::filter(
+    locality_source != "district_centroid",
+    PROVINCIA != "SAN JOSE"
+  ) %>%
+  dplyr::mutate(symptom_onset = as.Date(`FECHA INICIO SÍNTOMAS`)) %>%
+  dplyr::select(case_id, PROVINCIA, symptom_onset, geometry, locality_source)
+
+# Get valid case IDs
+valid_case_ids <- unique(cases_all$case_id)
+
+# Apply filters to flows: valid cases, valid direction, elevation < 1000m
+flows_slim <- flows_slim %>%
+  dplyr::filter(
+    case_id %in% valid_case_ids,
+    !is.na(direction),
+    !is.na(elev_o), !is.na(elev_d),
+    elev_o < 1000, elev_d < 1000,
+    tile_o != tile_d  # drop zero-length trips
+  )
+
+# Split flows by direction
+flows_in_all  <- flows_slim %>% dplyr::filter(direction == "Incoming")
+flows_out_all <- flows_slim %>% dplyr::filter(direction == "Outgoing")
+
+# Clean up: remove valid_case_ids (no longer needed)
+rm(valid_case_ids)
+```
+
+```{r calculate-weekly-travel}
+# ------------------------------------------------------------------------------
+# Calculate Weekly Travel Aggregations
+# ------------------------------------------------------------------------------
+# Add week_start to cases
+cases_all_weeks <- cases_all %>%
+  mutate(
+    symptom_onset = as.Date(symptom_onset),
+    week_start    = floor_date(symptom_onset, unit = "week")
+  )
+
+# Get all unique index weeks
+all_weeks <- cases_all_weeks %>%
+  filter(!is.na(week_start)) %>%
+  distinct(week_start) %>%
+  arrange(week_start) %>%
+  pull(week_start)
+
+# For each week, compute OUTGOING travel from cases in that week
+# Result: one row per (week_start, tile_id) with summed people_travel
+# where tile_id is the DESTINATION tile (tile_d)
+travel_df_week <- purrr::map_dfr(all_weeks, function(wk) {
+  
+  window_start <- wk
+  window_end   <- wk + 6   # 7-day window
+  
+  # Get case_ids with onset in the window
+  case_ids_window <- cases_all_weeks %>%
+    filter(
+      !is.na(symptom_onset),
+      symptom_onset >= window_start,
+      symptom_onset <= window_end
+    ) %>%
+    pull(case_id) %>%
+    unique()
+  
+  if (length(case_ids_window) == 0) {
+    return(NULL)
+  }
+  
+  # OUTGOING ONLY: from case tile to destination tile_d
+  flows_out_all %>%
+    filter(case_id %in% case_ids_window) %>%
+    st_drop_geometry() %>%
+    group_by(
+      week_start = wk,     # index week this window is anchored on
+      tile_id    = tile_d  # destination tile
+    ) %>%
+    summarise(
+      people = sum(people_travel, na.rm = TRUE),
+      .groups = "drop"
+    )
+})
+
+# Clean up: remove intermediate week calculation objects
+rm(all_weeks, cases_all_weeks)
+```
+
+```{r save-shiny-data}
+# ------------------------------------------------------------------------------
+# Save Final Data for Shiny App
+# ------------------------------------------------------------------------------
+# Create tiles_base alias for consistency with Shiny app
+tiles_base <- pop_tiles
+
+# Compile all data needed for Shiny app
+shiny_data <- list(
+  districts_base = districts_base,
+  cases_all      = cases_all,
+  tiles_base     = tiles_base,
+  travel_df_week = travel_df_week
+)
+
+# Save to Shiny app data directory
+saveRDS(shiny_data, file.path(shiny_data_dir, "shiny_mobility_data.rds"))
+
+# Clean up: remove helper functions and aliases (data is saved)
+rm(norm_txt, make_key, districts_base, tiles_base)
+```
+
+```{r aggregate-travel-from-malaria-tiles}
+# ------------------------------------------------------------------------------
+# Aggregate Travel from Tiles with Malaria Cases
+# ------------------------------------------------------------------------------
+# Create data frame with one row per tile showing total people traveling in
+# from tiles that have malaria cases
+
+# Get tiles that have malaria cases
+tiles_with_cases <- cases_tiles %>%
+  distinct(tile_id) %>%
+  pull(tile_id)
+
+# Aggregate incoming flows: for each destination tile, sum people_travel
+# from origin tiles that have malaria cases
+tile_travel_from_malaria <- flows_in_all %>%
+  # Filter to only flows originating from tiles with malaria cases
+  filter(tile_o %in% tiles_with_cases) %>%
+  # Drop geometry for aggregation
+  st_drop_geometry() %>%
+  # Group by destination tile and sum people traveling in
+  group_by(tile_id = tile_d) %>%
+  summarise(
+    total_people_in_from_malaria_tiles = sum(people_travel, na.rm = TRUE),
+    n_flows_from_malaria_tiles = n(),
+    .groups = "drop"
+  ) %>%
+  # Join with all tiles to include tiles with zero travel
+  right_join(
+    pop_tiles %>% 
+      st_drop_geometry() %>% 
+      select(tile_id),
+    by = "tile_id"
+  ) %>%
+  # Replace NA with 0 for tiles with no incoming travel from malaria tiles
+  mutate(
+    total_people_in_from_malaria_tiles = if_else(
+      is.na(total_people_in_from_malaria_tiles), 
+      0, 
+      total_people_in_from_malaria_tiles
+    ),
+    n_flows_from_malaria_tiles = if_else(
+      is.na(n_flows_from_malaria_tiles), 
+      0L, 
+      n_flows_from_malaria_tiles
+    )
+  ) %>%
+  # Add indicator for whether this tile itself has malaria cases
+  mutate(
+    has_malaria_case = tile_id %in% tiles_with_cases
+  ) %>%
+  # Join with population data
+  left_join(
+    pop_tiles %>% 
+      st_drop_geometry() %>% 
+      select(tile_id, worldpop_population, ghsl_population_2025),
+    by = "tile_id"
+  ) %>%
+  # Arrange by total people in (descending)
+  arrange(desc(total_people_in_from_malaria_tiles))
+
+# Clean up: remove intermediate objects
+rm(tiles_with_cases)
+```
+
+```{r create-static-malaria-mobility-figures}
+# ------------------------------------------------------------------------------
+# Create Static Malaria/Mobility Figures
+# ------------------------------------------------------------------------------
+# Load required libraries for visualization
+library(ggplot2)
+library(leaflet)
+library(viridis)
+
+# Recreate aliases for visualization (if they were removed)
+tiles_base <- pop_tiles
+districts_base <- districts_min
+
+# ------------------------------------------------------------------------------
+# Figure 1: Malaria Cases and Connected Mobility Flows
+# ------------------------------------------------------------------------------
+# Prepare flows for visualization
+flows_case_od <- flows_out_all
+
+# Create flow categories based on quantiles (avoid issues if very small n)
+if (nrow(flows_case_od) > 0) {
+  brks <- quantile(flows_case_od$people_travel,
+                   probs = c(0, 0.8, 0.95, 1),
+                   na.rm = TRUE)
+  # If quantiles collapse, jitter slightly
+  brks[duplicated(brks)] <- brks[duplicated(brks)] + 1e-6
+} else {
+  brks <- c(0, 1, 2, 3)
+}
+
+flows_case_od <- flows_case_od %>%
+  mutate(
+    flow_cat = cut(
+      people_travel,
+      breaks = brks,
+      include.lowest = TRUE,
+      labels = c("small", "medium", "large")
+    )
+  )
+
+# Sample small flows for visualization performance
+set.seed(123)
+small_n <- min(nrow(flows_case_od %>% filter(flow_cat == "small")), 3000)
+
+small_flows <- flows_case_od %>%
+  filter(flow_cat == "small") %>%
+  slice_sample(n = small_n)
+
+flows_case_plot <- bind_rows(
+  small_flows,
+  flows_case_od %>% filter(flow_cat != "small")
+)
+
+# Create flow visualization plot
+p_flows <- ggplot() +
+  # Base map: districts
+  geom_sf(data = districts_min,
+          fill = "grey97",
+          color = "grey80",
+          linewidth = 0.2) +
+  # Tiles
+  geom_sf(data = pop_tiles,
+          fill = NA,
+          color = "grey90",
+          linewidth = 0.15) +
+  # Flows – use the sampled / categorized df
+  geom_sf(data = flows_case_plot,
+          aes(linewidth = flow_cat,
+              alpha    = flow_cat),
+          color = "steelblue4",
+          lineend = "round",
+          show.legend = "line") +
+  # Malaria cases as points
+  geom_sf(data = mal23_pts,
+          aes(color = "Malaria case"),
+          size = 0.5,
+          alpha = 0.9,
+          show.legend = TRUE) +
+  scale_linewidth_manual(
+    name   = "Travel volume",
+    values = c(
+      "small"  = 0.1,
+      "medium" = 0.4,
+      "large"  = 0.8
+    )
+  ) +
+  scale_alpha_manual(
+    name   = "Travel volume",
+    values = c(
+      "small"  = 0.05,
+      "medium" = 0.2,
+      "large"  = 0.6
+    )
+  ) +
+  scale_color_manual(
+    name   = NULL,
+    values = c("Malaria case" = "darkred")
+  ) +
+  coord_sf() +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    panel.grid.major = element_blank(),
+    axis.title = element_blank(),
+    axis.text = element_blank()
+  ) +
+  labs(
+    title    = "Malaria cases and connected mobility flows",
+    subtitle = "Flows shown only if origin or destination tile includes ≥1 malaria case"
+  )
+
+p_flows
+
+# ------------------------------------------------------------------------------
+# Figure 2: Malaria Cases Per Week (Faceted)
+# ------------------------------------------------------------------------------
+# Prepare cases by week for 2023
+cases_week <- mal23_pts %>%
+  mutate(
+    symptom_onset = as.Date(`FECHA INICIO SÍNTOMAS`),
+    year  = year(symptom_onset),
+    week  = floor_date(symptom_onset, unit = "week")  # Monday-based weeks
+  ) %>%
+  filter(year == 2023)
+
+# Static faceted map: malaria cases per week
+p_cases_week <- ggplot() +
+  geom_sf(data = tiles_base, fill = "grey95", color = "grey80", size = 0.1) +
+  geom_sf(
+    data  = cases_week,
+    aes(color = week),
+    size  = 1,
+    alpha = 0.8
+  ) +
+  scale_color_viridis_c(option = "plasma", guide = "none") +
+  coord_sf() +
+  facet_wrap(~ week, ncol = 6) +   # 6 columns of weeks
+  theme_minimal(base_size = 10) +
+  theme(
+    panel.grid.major = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank()
+  ) +
+  labs(
+    title = "Malaria cases per week, 2023",
+    subtitle = "Each panel shows cases in that week",
+    x = NULL, y = NULL
+  )
+
+p_cases_week
+
+# ------------------------------------------------------------------------------
+# Figure 3: Interactive Map of Low-Elevation Tiles with Population
+# ------------------------------------------------------------------------------
+# Add elevation from mob to pop_tiles (drop mob geometry so we don't confuse sf)
+pop_tiles_low <- pop_tiles %>%
+  left_join(
+    mob %>% st_drop_geometry() %>% select(tile_id, elev_min_m, activity),
+    by = "tile_id"
+  ) %>%
+  filter(elev_min_m < 500)
+
+# Create interactive leaflet map
+m_pop_tiles <- leaflet(pop_tiles_low) %>%
+  addTiles() %>%
+  addPolygons(
+    fillColor = ~colorNumeric(
+      palette = "YlOrRd",
+      domain  = log1p(pop_tiles_low$ghsl_population_2025)
+    )(log1p(ghsl_population_2025)),
+    fillOpacity = 0.7,
+    color       = "grey40",
+    weight      = 0.2
+  )
+
+m_pop_tiles
+
+# Clean up: remove intermediate visualization objects
+rm(flows_case_od, brks, small_n, small_flows, flows_case_plot, 
+   cases_week, pop_tiles_low, tiles_base)
+```
+
