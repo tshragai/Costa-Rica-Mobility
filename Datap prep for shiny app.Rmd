@@ -259,7 +259,7 @@ flows_slim <- flows_all_elev %>%
     elev_o = elev_o_ft,
     elev_d = elev_d_ft,
     ds = as.Date(ds),
-    people_travel,             # *** this is the one you care about ***
+    people_travel,             
     origin_pop,
     visit_fraction,
     geometry
@@ -291,14 +291,72 @@ flows_slim <- flows_slim %>%
 flows_in_all  <- flows_slim %>% dplyr::filter(direction == "Incoming")
 flows_out_all <- flows_slim %>% dplyr::filter(direction == "Outgoing")
 
+#Calculate trips per week window
+
+# 1. Make sure dates are Date and define the "index week" for each case
+cases_all_weeks <- cases_all %>%
+  mutate(
+    symptom_onset = as.Date(symptom_onset),
+    week_start    = floor_date(symptom_onset, unit = "week")
+  )
+
+# All unique index weeks present in the data
+all_weeks <- cases_all_weeks %>%
+  filter(!is.na(week_start)) %>%
+  distinct(week_start) %>%
+  arrange(week_start) %>%
+  pull(week_start)
+
+# 2. For each week_start, compute OUTGOING travel from cases in that week
+#    AND the following two weeks (21 days total).
+#
+# Result: one row per (week_start, tile_id) with summed people_travel
+#         where tile_id is the DESTINATION tile (tile_d).
+
+travel_df_week <- purrr::map_dfr(all_weeks, function(wk) {
+  
+  window_start <- wk
+  window_end   <- wk+6   
+  
+  # case_ids with onset in [week_start, week_start + 20 days]
+  case_ids_window <- cases_all_weeks %>%
+    filter(
+      !is.na(symptom_onset),
+      symptom_onset >= window_start,
+      symptom_onset <= window_end
+    ) %>%
+    pull(case_id) %>%
+    unique()
+  
+  if (length(case_ids_window) == 0) {
+    return(NULL)
+  }
+  
+  # OUTGOING ONLY: from case tile to destination tile_d
+  flows_out_all %>%
+    filter(case_id %in% case_ids_window) %>%
+    st_drop_geometry() %>%
+    group_by(
+      week_start = wk,     # index week this window is anchored on
+      tile_id    = tile_d  # destination tile
+    ) %>%
+    summarise(
+      people = sum(people_travel, na.rm = TRUE),
+      .groups = "drop"
+    )
+})
+
 #save data for shiny app
+
+setwd("~/Costa-Rica-Mobility/Visualize_CR_mobility_data/Data")
 shiny_data <- list(
   districts_base = districts_base,
-  flows_slim = flows_slim,
+  #flows_slim = flows_slim,
   cases_all      = cases_all,
-  flows_in_all   = flows_in_all,
-  flows_out_all  = flows_out_all,
-  tiles_base = pop_tiles
+  #flows_in_all   = flows_in_all,
+  #flows_out_all  = flows_out_all,
+  tiles_base = pop_tiles,
+  travel_df_week=travel_df_week
 )
 
 saveRDS(shiny_data, "shiny_mobility_data.rds")
@@ -415,5 +473,102 @@ p_flows <- ggplot() +
 
 p_flows
 ```
+```{r static map}
 
+cases_week <- mal23_pts %>%
+  mutate(
+    symptom_onset = as.Date(`FECHA INICIO SÍNTOMAS`),
+    year  = year(symptom_onset),
+    week  = floor_date(symptom_onset, unit = "week")  # Monday-based weeks
+  ) %>%
+  filter(year == 2023)   # <-- change year as needed
+
+# 2. Static faceted map: malaria cases per week
+ggplot() +
+  geom_sf(data = tiles_base, fill = "grey95", color = "grey80", size = 0.1) +
+  geom_sf(
+    data  = cases_week,
+    aes(color = week),
+    size  = 1,
+    alpha = 0.8
+  ) +
+  scale_color_viridis_c(option = "plasma", guide = "none") +
+  coord_sf() +
+  facet_wrap(~ week, ncol = 6) +   # 6 columns of weeks
+  theme_minimal(base_size = 10) +
+  theme(
+    panel.grid.major = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank()
+  ) +
+  labs(
+    title = "Malaria cases per week, 2023",
+    subtitle = "Each panel shows cases in that week",
+    x = NULL, y = NULL
+  )
+
+# add elevation from mob to pop_tiles (drop mob geometry so we don't confuse sf)
+pop_tiles_low <- pop_tiles %>%
+  left_join(
+    mob %>% st_drop_geometry() %>% select(tile_id, elev_min_m,activity),
+    by = "tile_id"
+  ) %>%
+  filter(elev_min_m < 500)
+
+leaflet(pop_tiles_low) %>%
+  addTiles() %>%
+  addPolygons(
+    fillColor = ~colorNumeric(
+      palette = "YlOrRd",
+      domain  = log1p(pop_tiles_low$ghsl_population_2025)
+    )(log1p(ghsl_population_2025)),
+    fillOpacity = 0.7,
+    color       = "grey40",
+    weight      = 0.2
+  )
+```
+Static graph
+```{r static graph}
+setwd("~/Costa-Rica-Mobility/Data")
+flows_all_elev<-readRDS("flows_all_elev.rds")
+#population per tile data
+setwd("~/Costa-Rica-Mobility/Data")
+pop_tiles <- st_read("costa_rica_activity_tiles_population.geojson")
+mob <- st_read("activity_by_pop_tiles_overall_wgs84.geojson") %>%
+  st_make_valid() %>%
+  st_transform(4326)
+#malaria data with point locations
+mal23_merged <- readRDS(file.path(data_dir, "mal23_merged.rds"))
+#create points
+mal23_pts <- mal23_merged %>%
+  filter(!is.na(lon_final), !is.na(lat_final)) %>%
+  mutate(case_id = row_number()) %>%
+  st_as_sf(coords = c("lon_final", "lat_final"),
+           crs = 4326,
+           remove = FALSE)
+
+
+# add elevation from mob to pop_tiles (drop mob geometry so we don't confuse sf)
+pop_tiles_low <- pop_tiles %>%
+  left_join(
+    mob %>% st_drop_geometry() %>% select(tile_id, elev_min_m,activity),
+    by = "tile_id"
+  ) %>%
+  filter(elev_min_m < 1000)
+
+cases_weekly <- mal23_pts %>%
+  mutate(
+    case_date = as.Date(date),
+    week_start = floor_date(case_date, unit = "week")
+  ) %>%
+  group_by(tile_id, week_start) %>%      # tile_id must match tiles_base
+  summarise(cases_in_tile = n(), .groups = "drop")
+
+flows_static <- flows_all_elev %>%
+  select(tile_origin, tile_destination, people)
+
+case_tiles_by_week <- cases_weekly %>%
+  group_by(week_start) %>%
+  summarise(case_tiles = list(tile_id), .groups = "drop")
+```
 
