@@ -20,6 +20,7 @@ library(leaflet)
 library(RColorBrewer)
 library(slippymath)
 library(scales)
+library(googledrive)
 ```
 
 Create tiles from lat/lon points provided by Meta
@@ -89,9 +90,25 @@ leaflet() %>%
                    fillOpacity = 1, stroke = FALSE) 
 
 
-## save output (unchanged file targets; rename if you want to distinguish weighted)
-if (!dir.exists("data")) dir.create("data")
-st_write(squares_ll, "data/costa_rica_activity_tiles.gpkg", delete_dsn = TRUE)
+## save output to Google Drive
+# Write to temporary file first, then upload to Google Drive
+tmp_gpkg <- tempfile(fileext = ".gpkg")
+st_write(squares_ll, tmp_gpkg, delete_dsn = TRUE)
+
+# Upload to Google Drive
+message("Uploading costa_rica_activity_tiles.gpkg to Google Drive...")
+drive_auth()
+target_folder <- as_id("1j9yE_C6okSNO73RROigLONOU9VGZ9wJa")
+drive_upload(
+  tmp_gpkg,
+  name = "costa_rica_activity_tiles.gpkg",
+  path = target_folder,
+  overwrite = TRUE
+)
+message("✓ Successfully uploaded to Google Drive folder")
+
+# Clean up temporary file
+unlink(tmp_gpkg)
 
 rm(M, pts_ll, pts_m, squares_ll, squares_m, XY)
 ```
@@ -209,21 +226,42 @@ tile_activity_by_ds_sf <- pop_tiles %>%
   dplyr::select(tile_id, geometry) %>%
   dplyr::right_join(tile_activity_by_ds, by = c("tile_id" = "d_tile_id"))
 
-## --- Save outputs ---
-if (!dir.exists("data")) dir.create("data")
+## --- Save outputs to Google Drive ---
+# Write all files to temporary locations first, then upload to Google Drive
+target_folder <- as_id("1j9yE_C6okSNO73RROigLONOU9VGZ9wJa")
+drive_auth()
 
-st_write(tile_activity_overall_sf, "data/activity_by_pop_tiles_overall.gpkg", delete_dsn = TRUE)
-st_write(tile_activity_by_ds_sf, "data/activity_by_pop_tiles_by_ds.gpkg", delete_dsn = TRUE)
+# Save GPKG files (projected coordinates)
+tmp_overall_gpkg <- tempfile(fileext = ".gpkg")
+tmp_by_ds_gpkg <- tempfile(fileext = ".gpkg")
+st_write(tile_activity_overall_sf, tmp_overall_gpkg, delete_dsn = TRUE)
+st_write(tile_activity_by_ds_sf, tmp_by_ds_gpkg, delete_dsn = TRUE)
 
-# WGS84 for leaflet
+# Transform to WGS84 for leaflet
 tile_activity_overall_ll <- st_transform(tile_activity_overall_sf, 4326)
 tile_activity_by_ds_ll <- st_transform(tile_activity_by_ds_sf, 4326)
 
-st_write(tile_activity_overall_ll, "data/activity_by_pop_tiles_overall_wgs84.geojson", delete_dsn = TRUE)
-st_write(tile_activity_by_ds_ll, "data/activity_by_pop_tiles_by_ds_wgs84.geojson", delete_dsn = TRUE)
+# Save GeoJSON files (WGS84)
+tmp_overall_geojson <- tempfile(fileext = ".geojson")
+tmp_by_ds_geojson <- tempfile(fileext = ".geojson")
+st_write(tile_activity_overall_ll, tmp_overall_geojson, delete_dsn = TRUE)
+st_write(tile_activity_by_ds_ll, tmp_by_ds_geojson, delete_dsn = TRUE)
 
-# ca_aug to use later
-st_write(ca_aug, "data/ca_aug.csv", delete_dsn = TRUE)
+# Save CSV file
+tmp_ca_aug <- tempfile(fileext = ".csv")
+fwrite(ca_aug, tmp_ca_aug)
+
+# Upload all files to Google Drive
+message("Uploading files to Google Drive...")
+drive_upload(tmp_overall_gpkg, name = "activity_by_pop_tiles_overall.gpkg", path = target_folder, overwrite = TRUE)
+drive_upload(tmp_by_ds_gpkg, name = "activity_by_pop_tiles_by_ds.gpkg", path = target_folder, overwrite = TRUE)
+drive_upload(tmp_overall_geojson, name = "activity_by_pop_tiles_overall_wgs84.geojson", path = target_folder, overwrite = TRUE)
+drive_upload(tmp_by_ds_geojson, name = "activity_by_pop_tiles_by_ds_wgs84.geojson", path = target_folder, overwrite = TRUE)
+drive_upload(tmp_ca_aug, name = "ca_aug.csv", path = target_folder, overwrite = TRUE)
+message("✓ Successfully uploaded all files to Google Drive folder")
+
+# Clean up temporary files
+unlink(c(tmp_overall_gpkg, tmp_by_ds_gpkg, tmp_overall_geojson, tmp_by_ds_geojson, tmp_ca_aug))
 
 rm(tiles_crs, visit_info,visit_sf,visit_with_tile)
 
@@ -233,8 +271,18 @@ rm(tiles_crs, visit_info,visit_sf,visit_with_tile)
 Plot it in Leaflet
 ```{r}
 
-setwd("~/Costa-Rica-Mobility/Data")
-tile_activity_overall_ll <- st_read("activity_by_pop_tiles_overall_wgs84.geojson")  
+# Download from Google Drive and read
+drive_auth()
+target_folder <- as_id("1j9yE_C6okSNO73RROigLONOU9VGZ9wJa")
+tmp_geojson <- tempfile(fileext = ".geojson")
+file_info <- drive_find(pattern = "activity_by_pop_tiles_overall_wgs84.geojson", path = target_folder)
+if (nrow(file_info) > 0) {
+  drive_download(file = as_id(file_info$id[1]), path = tmp_geojson, overwrite = TRUE)
+  tile_activity_overall_ll <- st_read(tmp_geojson)
+  unlink(tmp_geojson)  # Clean up temporary file
+} else {
+  stop("File 'activity_by_pop_tiles_overall_wgs84.geojson' not found in Google Drive folder")
+}  
 
 tile_activity_lonlat<-tile_activity_overall_ll%>%
   mutate(activity_log=log(activity+1))

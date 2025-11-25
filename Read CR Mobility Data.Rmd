@@ -21,6 +21,7 @@ library(leaflet)
 library(RColorBrewer)
 library(slippymath)
 library(scales)
+library(googledrive)
 setwd("~/Downloads")
 ```
 
@@ -86,7 +87,8 @@ process_one <- function(input_file, output_file) {
 ##single combined output (optional)
 # ===========================================
 # Uncomment to produce one big file with all filtered rows
- combined_out <- file.path(input_dir, "all_processed_combined.csv")
+# Create combined file locally first, then upload to Google Drive
+ combined_out <- tempfile(fileext = ".csv")
  if (file.exists(combined_out)) file.remove(combined_out)
  for (infile in csv_files) {
    message("Appending from: ", basename(infile))
@@ -105,6 +107,25 @@ process_one <- function(input_file, output_file) {
    }
    unlink(tmp_out)
  }
+ 
+ # Upload to Google Drive (specific folder)
+ if (file.exists(combined_out) && file.info(combined_out)$size > 0) {
+   message("Uploading all_processed_combined.csv to Google Drive...")
+   drive_auth()
+   target_folder <- as_id("1j9yE_C6okSNO73RROigLONOU9VGZ9wJa")
+   drive_upload(
+     combined_out,
+     name = "all_processed_combined.csv",
+     path = target_folder,
+     overwrite = TRUE
+   )
+   message("✓ Successfully uploaded to Google Drive folder")
+ } else {
+   message("⚠ No data to upload - combined file is empty or doesn't exist")
+ }
+ 
+ # Clean up local temporary file
+ if (file.exists(combined_out)) unlink(combined_out)
 
 # ===========================================
 # MODE A: per-file outputs (recommended)
